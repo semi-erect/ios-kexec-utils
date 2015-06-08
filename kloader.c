@@ -110,7 +110,7 @@ static mach_port_t kernel_task = 0;
 static uint32_t ttb_template[TTB_SIZE] = { };
 
 static void *ttb_template_ptr = &ttb_template[0];
-static uint32_t kernel_base = DEFAULT_KERNEL_SLIDE;
+static vm_address_t kernel_base = DEFAULT_KERNEL_SLIDE;
 
 typedef struct pmap_partial_t {
     uint32_t tte_virt;
@@ -697,6 +697,13 @@ uint32_t find_pmap_location(uint32_t region, uint8_t * kdata, size_t ksize)
     if (!ptr)
         return 0;
 
+    // Find the beginning of it (we may have a version that throws panic after the function end).
+    while (*ptr != 0xB5F0) {
+        if ((uint8_t *)ptr == kdata)
+            return 0;
+        ptr--;
+    }
+
     // Find the end of it.
     const uint8_t search_function_end[] = { 0xF0, 0xBD };
     ptr = memmem(ptr, ksize - ((uintptr_t) ptr - (uintptr_t) kdata), search_function_end, sizeof(search_function_end));
@@ -805,22 +812,38 @@ vm_address_t get_kernel_base()
     vm_size_t size;
     mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
     unsigned int depth = 0;
-    vm_address_t addr = 0x81200000;
+    vm_address_t addr = 0x81200000; /* arm64: addr = 0xffffff8000000000 */
 
     ret = task_for_pid(mach_task_self(), 0, &kernel_task);
     if (ret != KERN_SUCCESS)
-        return 0;
+        return -1;
 
     while (1) {
         ret = vm_region_recurse_64(kernel_task, &addr, &size, &depth, (vm_region_info_t) & info, &info_count);
         if (ret != KERN_SUCCESS)
             break;
-        if (size > 1024 * 1024 * 1024)
+        if (size > 1024 * 1024 * 1024) {
+            /*
+             * https://code.google.com/p/iphone-dataprotection/
+             * hax, sometimes on iOS7 kernel starts at +0x200000 in the 1Gb region
+             */
+            pointer_t buf;
+            mach_msg_type_number_t sz = 0;
+            addr += 0x200000;
+            vm_read(kernel_task, addr + 0x1000, 512, &buf, &sz);
+            if (*((uint32_t *)buf) != 0xfeedface) {
+                addr -= 0x200000;
+                vm_read(kernel_task, addr + 0x1000, 512, &buf, &sz);
+                if (*((uint32_t*)buf) != 0xfeedface) {
+                    break;
+                }
+            }
             return addr;
+        }
         addr += size;
     }
 
-    return 0;
+    return -1;
 }
 
 static void generate_ttb_entries(void)
@@ -854,7 +877,7 @@ static void generate_ttb_entries(void)
 }
 
 #define DMPSIZE     0xd00000
-extern void *shellcode_begin, shellcode_end;
+extern char shellcode_begin[], shellcode_end[];
 extern uint32_t larm_init_tramp;
 extern uint32_t flush_dcache, invalidate_icache;
 extern uint32_t kern_base, kern_tramp_phys;
@@ -894,12 +917,18 @@ int main(int argc, char *argv[])
     } else if (strcasestr(osversion, "s5l8920x") || strcasestr(osversion, "s5l8922x")) {
         PHYS_OFF = S5L8930_PHYS_OFF;
         phys_addr_remap = 0x4fe00000;
-    } else if (strcasestr(osversion, "s5l8940x")) {
+    } else if (strcasestr(osversion, "s5l8940x") || strcasestr(osversion, "s5l8942x") || strcasestr(osversion, "s5l8947x")) {
         /*
          * All others have the high ram base. 
          */
         PHYS_OFF = S5L8940_PHYS_OFF;
         phys_addr_remap = 0x9fe00000;
+    } else if (strcasestr(osversion, "s5l8945x")) {
+        PHYS_OFF = S5L8940_PHYS_OFF;
+        phys_addr_remap = 0xbfe00000;
+    } else if (strcasestr(osversion, "s5l8950x") || strcasestr(osversion, "s5l8955x")) {
+        PHYS_OFF = S5L8940_PHYS_OFF;
+        phys_addr_remap = 0xbfe00000;
     } else {
         printf("Bravely assuming you're on an 8940-class device (unrecognized). You are on your own.\n");
         /*
@@ -919,15 +948,10 @@ int main(int argc, char *argv[])
 #endif
 
     /*
-     * generate TTEs. 
-     */
-    generate_ttb_entries();
-
-    /*
      * get kernel base. 
      */
     kernel_base = get_kernel_base();
-    if (kernel_base == -1) {
+    if (kernel_base == (vm_address_t)-1) {
         printf("failed to get kernel_baseel base...\n");
         return -1;
     }
@@ -946,7 +970,7 @@ int main(int argc, char *argv[])
     /*
      * kill 
      */
-    uint32_t addr = kernel_base + 0x1000, e = 0, sz = 0;
+    vm_address_t addr = kernel_base + 0x1000, e = 0, sz = 0;
     uint8_t *p = malloc(DMPSIZE + 0x1000);
     pointer_t buf;
 
@@ -974,7 +998,7 @@ int main(int argc, char *argv[])
      * Read for kernel_pmap, dereference it for pmap_store. 
      */
     vm_read(kernel_task, kernel_pmap, 2048, &buf, &sz);
-    vm_read(kernel_task, *(uint32_t *) (buf), 2048, &buf, &sz);
+    vm_read(kernel_task, *(vm_address_t *) (buf), 2048, &buf, &sz);
 
     /*
      * We now have the struct. Let's copy it out to get the TTE base (we don't really need to do this
@@ -985,6 +1009,15 @@ int main(int argc, char *argv[])
     uint32_t tte_phys = part->tte_phys;
 
     printf("kernel pmap details: tte_virt: 0x%08x tte_phys: 0x%08x\n", tte_virt, tte_phys);
+    if (PHYS_OFF != (tte_phys & ~0xFFFFFFF)) {
+        printf("physOff 0x%08x should be 0x%08x\n", PHYS_OFF, tte_phys & ~0xFFFFFFF);
+        return -1;
+    }
+
+    /*
+     * generate TTEs. 
+     */
+    generate_ttb_entries();
 
     /*
      * Now, we can start reading at the TTE base and start writing in the descriptors. 
@@ -1062,30 +1095,34 @@ int main(int argc, char *argv[])
     kern_base = kernel_base;
     kern_tramp_phys = phys_addr_remap;
 
-#if 1
+#if 0
 
     printf("larm_init_tramp is at 0x%08x\n", larm_init_tramp);
-    bcopy((void *) &shellcode_begin, (void *) 0x7f000c00, (uint32_t) ((uintptr_t) & shellcode_end - (uintptr_t) & shellcode_begin));
+    bcopy(shellcode_begin, (void *) 0x7f000c00, shellcode_end - shellcode_begin);
     *(uint32_t *) sysent_common = 0x7f000c01;
 
     printf("Running shellcode now.\n");
     syscall(0);
+
+#else
+
+    static uint32_t arm[2] = { 0xe51ff004, 0 };
+    arm[1] = phys_addr_remap;
+    // Requires D-cache writeback.
+    printf("Tramp %x COMMMAP\n", larm_init_tramp);
+    printf("%lx, %lx\n", *(uintptr_t *) (larm_init_tramp), *(uintptr_t *) (larm_init_tramp + 4));
+    printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
+    bcopy((void *) arm, (void *) larm_init_tramp, sizeof(arm));
+    printf("%lx, %lx\n", *(uintptr_t *) (larm_init_tramp), *(uintptr_t *) (larm_init_tramp + 4));
+    printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
+
+#endif
 
     printf("Syncing disks.\n");
     int diskSync;
     for (diskSync = 0; diskSync < 10; diskSync++)
         sync();
     sleep(1);
-
-#else
-    // Requires D-cache writeback.
-    printf("Tramp %x COMMMAP\n", larm_init_tramp - kernel_base + SHADOWMAP_BEGIN);
-    printf("%x, %x\n", *(uintptr_t *) (0x7f000000 + (larm_init_tramp - kernel_base)), *(uintptr_t *) (0x7f000000 + (larm_init_tramp - kernel_base) + 4));
-    printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
-    bcopy((void *) arm, (void *) 0x7f000000 + (larm_init_tramp - kernel_base), sizeof(arm));
-    printf("%x, %x\n", *(uintptr_t *) (0x7f000000 + (larm_init_tramp - kernel_base)), *(uintptr_t *) (0x7f000000 + (larm_init_tramp - kernel_base) + 4));
-    printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
-#endif
 
     while (1) {
         printf("Magic happening now. (attempted!)\n");
@@ -1150,7 +1187,7 @@ __asm__("\n"
         "_flush_dcache:      .long   0xdeadbeef\n"
         "_invalidate_icache: .long   0xdeadbeef\n"
         "_shellcode_end:\n"
-        "    nop\n");
+        "    mov r8, r8\n");
 #else
 #error - this is only for ARM..
 #endif
