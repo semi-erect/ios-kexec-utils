@@ -1129,10 +1129,8 @@ int main(int argc, char *argv[])
     larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_base + 0x1000, (uint8_t *) p, DMPSIZE) + SHADOWMAP_BEGIN;
 
 #if USE_INLINED_SHELLCODE
-
     kern_base = kernel_base;
     kern_tramp_phys = phys_addr_remap;
-
 
     printf("larm_init_tramp is at 0x%08x\n", larm_init_tramp);
     bcopy(shellcode_begin, (void *) 0x7f000c00, shellcode_end - shellcode_begin);
@@ -1140,9 +1138,7 @@ int main(int argc, char *argv[])
 
     printf("Running shellcode now.\n");
     syscall(0);
-
 #else
-
     static uint32_t arm[2] = { 0xe51ff004, 0 };
     arm[1] = phys_addr_remap;
     // Requires D-cache writeback.
@@ -1152,15 +1148,12 @@ int main(int argc, char *argv[])
     bcopy((void *) arm, (void *) larm_init_tramp, sizeof(arm));
     printf("%lx, %lx\n", *(uintptr_t *) (larm_init_tramp), *(uintptr_t *) (larm_init_tramp + 4));
     printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
-
 #endif
 
     printf("Syncing disks.\n");
     int diskSync;
     for (diskSync = 0; diskSync < 10; diskSync++)
         sync();
-
-    sleep(1);
 
     mach_port_t fb = IOPMFindPowerManagement(MACH_PORT_NULL);
     if (fb == MACH_PORT_NULL) {
@@ -1170,7 +1163,6 @@ int main(int argc, char *argv[])
     schedule_autowake_during_notification(2.0);
 
     printf("Magic happening now. (attempted!)\n");
-
     kern_return_t kr = IOPMSleepSystem(fb);
     if (kr) {
         err(1, "IOPMSleepSystem returned %x\n", kr);
@@ -1178,7 +1170,6 @@ int main(int argc, char *argv[])
 
     // Never returns.
     CFRunLoopRun();
-
     return 0;
 }
 
