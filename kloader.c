@@ -24,8 +24,8 @@
  * Remap addresses:
  * 0x7fe00000 -> 0x9fe00000 (0x5fe00000) iBSS (jump-to only.)
  *
- * xcrun -sdk iphoneos clang kloader.c -arch armv7 -framework IOKit -framework CoreFoundation -no-integrated-as \
- *     -DINLINE_IT_ALL=1 -Wall -o kloader -miphoneos-version-min=6.0; ldid -Stfp0.plist kloader
+ * xcrun -sdk iphoneos clang kloader.c -arch armv7 -target arm-apple-darwin -framework IOKit -framework CoreFoundation -no-integrated-as \
+ *     -DINLINE_IT_ALL=1 -Wall -o kloader -miphoneos-version-min=6.0 && ldid -Stfp0.plist kloader
  */
 
 #include <mach/mach.h>
@@ -37,10 +37,12 @@
 #include <sys/sysctl.h>
 #include <err.h>
 #include <signal.h>
+#include <notify.h>
 
 typedef mach_port_t io_service_t;
 extern mach_port_t kIOMasterPortDefault;
 extern mach_port_t IOPMFindPowerManagement(mach_port_t);
+extern kern_return_t IOPMSchedulePowerEvent(CFDateRef time_to_wake, CFStringRef my_id, CFStringRef type);
 extern kern_return_t IOPMSleepSystem(mach_port_t);
 
 /*
@@ -105,6 +107,9 @@ uint32_t PHYS_OFF = S5L8930_PHYS_OFF;
 
 #define TTB_SIZE                4096
 #define DEFAULT_KERNEL_SLIDE    0x80000000
+
+#define NOTIFY_STATUS_OK 0
+#define kIOPMSystemPowerStateNotify "com.apple.powermanagement.systempowerstate"
 
 static mach_port_t kernel_task = 0;
 static uint32_t ttb_template[TTB_SIZE] = { };
@@ -876,11 +881,42 @@ static void generate_ttb_entries(void)
     return;
 }
 
+
+static void schedule_autowake_during_notification(CFTimeInterval autowake_delay)
+{
+    int out_token;
+    uint32_t status = notify_register_dispatch(kIOPMSystemPowerStateNotify, &out_token, dispatch_get_main_queue(), ^(int token) {
+      CFDateRef date = CFDateCreate(0, CFAbsoluteTimeGetCurrent() + autowake_delay);
+      kern_return_t kr = IOPMSchedulePowerEvent(date, NULL, CFSTR("WakeRelativeToSleep"));
+      if (kr)
+        printf("IOPMSchedulePowerEvent returned %x.\n", kr);
+      else
+        printf("Scheduled autowake.\n");
+
+      // Exit the program now or run loop will continue running forever.
+      exit(0);
+    });
+
+    if (status != NOTIFY_STATUS_OK) {
+        err(1, "Failed to register for kIOPMSystemPowerStateNotify: %x\n", status);
+    }
+}
+
 #define DMPSIZE     0xd00000
+#define USE_INLINED_SHELLCODE 0
+
+#if USE_INLINED_SHELLCODE
+
 extern char shellcode_begin[], shellcode_end[];
 extern uint32_t larm_init_tramp;
 extern uint32_t flush_dcache, invalidate_icache;
 extern uint32_t kern_base, kern_tramp_phys;
+
+#else
+
+uint32_t larm_init_tramp;
+
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -1092,10 +1128,11 @@ int main(int argc, char *argv[])
      */
     larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_base + 0x1000, (uint8_t *) p, DMPSIZE) + SHADOWMAP_BEGIN;
 
+#if USE_INLINED_SHELLCODE
+
     kern_base = kernel_base;
     kern_tramp_phys = phys_addr_remap;
 
-#if 0
 
     printf("larm_init_tramp is at 0x%08x\n", larm_init_tramp);
     bcopy(shellcode_begin, (void *) 0x7f000c00, shellcode_end - shellcode_begin);
@@ -1122,25 +1159,30 @@ int main(int argc, char *argv[])
     int diskSync;
     for (diskSync = 0; diskSync < 10; diskSync++)
         sync();
+
     sleep(1);
 
-    while (1) {
-        printf("Magic happening now. (attempted!)\n");
-        mach_port_t fb = IOPMFindPowerManagement(MACH_PORT_NULL);
-        if (fb != MACH_PORT_NULL) {
-            kern_return_t kr = IOPMSleepSystem(fb);
-            if (kr) {
-                err(1, "IOPMSleepSystem returned %x\n", kr);
-            }
-        } else {
-            err(1, "failed to get PM root port\n");
-        }
-        sleep(3);
+    mach_port_t fb = IOPMFindPowerManagement(MACH_PORT_NULL);
+    if (fb == MACH_PORT_NULL) {
+        err(1, "failed to get PM root port\n");
     }
+
+    schedule_autowake_during_notification(2.0);
+
+    printf("Magic happening now. (attempted!)\n");
+
+    kern_return_t kr = IOPMSleepSystem(fb);
+    if (kr) {
+        err(1, "IOPMSleepSystem returned %x\n", kr);
+    }
+
+    // Never returns.
+    CFRunLoopRun();
 
     return 0;
 }
 
+#if USE_INLINED_SHELLCODE
 /* how evil can you get???? */
 #if INLINE_IT_ALL
 /* hey, you gotta compile with -no-integrated-as */
@@ -1190,5 +1232,6 @@ __asm__("\n"
         "    mov r8, r8\n");
 #else
 #error - this is only for ARM..
+#endif
 #endif
 #endif
