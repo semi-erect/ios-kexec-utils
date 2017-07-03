@@ -33,9 +33,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <CoreFoundation/CoreFoundation.h>
-#include <sys/stat.h>
 #include <sys/sysctl.h>
-#include <err.h>
 #include <signal.h>
 #include <notify.h>
 
@@ -45,9 +43,7 @@ extern mach_port_t IOPMFindPowerManagement(mach_port_t);
 extern kern_return_t IOPMSchedulePowerEvent(CFDateRef time_to_wake, CFStringRef my_id, CFStringRef type);
 extern kern_return_t IOPMSleepSystem(mach_port_t);
 
-/*
- * ARM page bits for L1 sections.
- */
+/* ARM page bits for L1 sections */
 #define L1_SHIFT            20  /* log2(1MB) */
 
 #define L1_SECT_PROTO        (1 << 1)   /* 0b10 */
@@ -55,7 +51,7 @@ extern kern_return_t IOPMSleepSystem(mach_port_t);
 #define L1_SECT_B_BIT        (1 << 2)
 #define L1_SECT_C_BIT        (1 << 3)
 
-#define L1_SECT_SORDER       (0)    /* 0b00, not cacheable, strongly ordered. */
+#define L1_SECT_SORDER       (0)    /* 0b00, not cacheable, strongly ordered */
 #define L1_SECT_SH_DEVICE    (L1_SECT_B_BIT)
 #define L1_SECT_WT_NWA       (L1_SECT_C_BIT)
 #define L1_SECT_WB_NWA       (L1_SECT_B_BIT | L1_SECT_C_BIT)
@@ -71,14 +67,6 @@ extern kern_return_t IOPMSleepSystem(mach_port_t);
 
 #define PFN_SHIFT            2
 #define TTB_OFFSET(vaddr)    ((vaddr >> L1_SHIFT) << PFN_SHIFT)
-
-/*
- * RAM physical base begin. 
- */
-#define S5L8930_PHYS_OFF    0x40000000
-#define S5L8940_PHYS_OFF    0x80000000  /* Note: RAM base is identical for 8940-8955. */
-
-uint32_t PHYS_OFF = S5L8930_PHYS_OFF;
 
 /*
  * Shadowmap begin and end. 15MB of shadowmap is enough for the kernel.
@@ -107,40 +95,34 @@ uint32_t PHYS_OFF = S5L8930_PHYS_OFF;
 
 #define TTB_SIZE                4096
 #define DEFAULT_KERNEL_SLIDE    0x80000000
+#define CHUNKSIZE 2048
 
 #define NOTIFY_STATUS_OK 0
 #define kIOPMSystemPowerStateNotify "com.apple.powermanagement.systempowerstate"
 
-static mach_port_t kernel_task = 0;
+#define DMPSIZE     0xd00000
+static uint8_t kernel_dump[DMPSIZE + 0x1000];
 static uint32_t ttb_template[TTB_SIZE] = { };
-
-static void *ttb_template_ptr = &ttb_template[0];
-static vm_address_t kernel_base = DEFAULT_KERNEL_SLIDE;
 
 typedef struct pmap_partial_t {
     uint32_t tte_virt;
     uint32_t tte_phys;
-    /*
-     * ... 
-     */
+    /* ... */
 } pmap_partial_t;
 
 /* --- planetbeing patchfinder --- */
 
-static uint32_t bit_range(uint32_t x, int start, int end)
-{
+static uint32_t bit_range(uint32_t x, int start, int end) {
     x = (x << (31 - start)) >> (31 - start);
     x = (x >> end);
     return x;
 }
 
-static uint32_t ror(uint32_t x, int places)
-{
+static uint32_t ror(uint32_t x, int places) {
     return (x >> places) | (x << (32 - places));
 }
 
-static int thumb_expand_imm_c(uint16_t imm12)
-{
+static int thumb_expand_imm_c(uint16_t imm12) {
     if (bit_range(imm12, 11, 10) == 0) {
         switch (bit_range(imm12, 9, 8)) {
         case 0:
@@ -160,13 +142,11 @@ static int thumb_expand_imm_c(uint16_t imm12)
     }
 }
 
-static int insn_is_32bit(uint16_t * i)
-{
+static int insn_is_32bit(uint16_t * i) {
     return (*i & 0xe000) == 0xe000 && (*i & 0x1800) != 0x0;
 }
 
-static int insn_is_bl(uint16_t * i)
-{
+static int insn_is_bl(uint16_t * i) {
     if ((*i & 0xf800) == 0xf000 && (*(i + 1) & 0xd000) == 0xd000)
         return 1;
     else if ((*i & 0xf800) == 0xf000 && (*(i + 1) & 0xd001) == 0xc000)
@@ -175,8 +155,7 @@ static int insn_is_bl(uint16_t * i)
         return 0;
 }
 
-static uint32_t insn_bl_imm32(uint16_t * i)
-{
+static uint32_t insn_bl_imm32(uint16_t * i) {
     uint16_t insn0 = *i;
     uint16_t insn1 = *(i + 1);
     uint32_t s = (insn0 >> 10) & 1;
@@ -190,13 +169,11 @@ static uint32_t insn_bl_imm32(uint16_t * i)
     return imm32;
 }
 
-static int insn_is_b_conditional(uint16_t * i)
-{
+static int insn_is_b_conditional(uint16_t * i) {
     return (*i & 0xF000) == 0xD000 && (*i & 0x0F00) != 0x0F00 && (*i & 0x0F00) != 0xE;
 }
 
-static int insn_is_b_unconditional(uint16_t * i)
-{
+static int insn_is_b_unconditional(uint16_t * i) {
     if ((*i & 0xF800) == 0xE000)
         return 1;
     else if ((*i & 0xF800) == 0xF000 && (*(i + 1) & 0xD000) == 9)
@@ -205,13 +182,11 @@ static int insn_is_b_unconditional(uint16_t * i)
         return 0;
 }
 
-static int insn_is_ldr_literal(uint16_t * i)
-{
+static int insn_is_ldr_literal(uint16_t * i) {
     return (*i & 0xF800) == 0x4800 || (*i & 0xFF7F) == 0xF85F;
 }
 
-static int insn_ldr_literal_rt(uint16_t * i)
-{
+static int insn_ldr_literal_rt(uint16_t * i) {
     if ((*i & 0xF800) == 0x4800)
         return (*i >> 8) & 7;
     else if ((*i & 0xFF7F) == 0xF85F)
@@ -220,8 +195,7 @@ static int insn_ldr_literal_rt(uint16_t * i)
         return 0;
 }
 
-static int insn_ldr_literal_imm(uint16_t * i)
-{
+static int insn_ldr_literal_imm(uint16_t * i) {
     if ((*i & 0xF800) == 0x4800)
         return (*i & 0xF) << 2;
     else if ((*i & 0xFF7F) == 0xF85F)
@@ -230,103 +204,19 @@ static int insn_ldr_literal_imm(uint16_t * i)
         return 0;
 }
 
-// TODO: More encodings
-static int insn_is_ldr_imm(uint16_t * i)
-{
-    uint8_t opA = bit_range(*i, 15, 12);
-    uint8_t opB = bit_range(*i, 11, 9);
-
-    return opA == 6 && (opB & 4) == 4;
-}
-
-static int insn_ldr_imm_rt(uint16_t * i)
-{
+static int insn_ldr_imm_rt(uint16_t * i) {
     return (*i & 7);
 }
 
-static int insn_ldr_imm_rn(uint16_t * i)
-{
+static int insn_ldr_imm_rn(uint16_t * i) {
     return ((*i >> 3) & 7);
 }
 
-static int insn_ldr_imm_imm(uint16_t * i)
-{
+static int insn_ldr_imm_imm(uint16_t * i) {
     return ((*i >> 6) & 0x1F);
 }
 
-// TODO: More encodings
-static int insn_is_ldrb_imm(uint16_t * i)
-{
-    return (*i & 0xF800) == 0x7800;
-}
-
-static int insn_ldrb_imm_rt(uint16_t * i)
-{
-    return (*i & 7);
-}
-
-static int insn_ldrb_imm_rn(uint16_t * i)
-{
-    return ((*i >> 3) & 7);
-}
-
-static int insn_ldrb_imm_imm(uint16_t * i)
-{
-    return ((*i >> 6) & 0x1F);
-}
-
-static int insn_is_ldr_reg(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0x5800)
-        return 1;
-    else if ((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return 1;
-    else
-        return 0;
-}
-
-static int insn_ldr_reg_rn(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0x5800)
-        return (*i >> 3) & 0x7;
-    else if ((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return (*i & 0xF);
-    else
-        return 0;
-}
-
-int insn_ldr_reg_rt(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0x5800)
-        return *i & 0x7;
-    else if ((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return (*(i + 1) >> 12) & 0xF;
-    else
-        return 0;
-}
-
-int insn_ldr_reg_rm(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0x5800)
-        return (*i >> 6) & 0x7;
-    else if ((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return *(i + 1) & 0xF;
-    else
-        return 0;
-}
-
-static int insn_ldr_reg_lsl(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0x5800)
-        return 0;
-    else if ((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return (*(i + 1) >> 4) & 0x3;
-    else
-        return 0;
-}
-
-static int insn_is_add_reg(uint16_t * i)
-{
+static int insn_is_add_reg(uint16_t * i) {
     if ((*i & 0xFE00) == 0x1800)
         return 1;
     else if ((*i & 0xFF00) == 0x4400)
@@ -337,8 +227,7 @@ static int insn_is_add_reg(uint16_t * i)
         return 0;
 }
 
-static int insn_add_reg_rd(uint16_t * i)
-{
+static int insn_add_reg_rd(uint16_t * i) {
     if ((*i & 0xFE00) == 0x1800)
         return (*i & 7);
     else if ((*i & 0xFF00) == 0x4400)
@@ -349,8 +238,7 @@ static int insn_add_reg_rd(uint16_t * i)
         return 0;
 }
 
-static int insn_add_reg_rn(uint16_t * i)
-{
+static int insn_add_reg_rn(uint16_t * i) {
     if ((*i & 0xFE00) == 0x1800)
         return ((*i >> 3) & 7);
     else if ((*i & 0xFF00) == 0x4400)
@@ -361,8 +249,7 @@ static int insn_add_reg_rn(uint16_t * i)
         return 0;
 }
 
-static int insn_add_reg_rm(uint16_t * i)
-{
+static int insn_add_reg_rm(uint16_t * i) {
     if ((*i & 0xFE00) == 0x1800)
         return (*i >> 6) & 7;
     else if ((*i & 0xFF00) == 0x4400)
@@ -373,23 +260,19 @@ static int insn_add_reg_rm(uint16_t * i)
         return 0;
 }
 
-static int insn_is_movt(uint16_t * i)
-{
+static int insn_is_movt(uint16_t * i) {
     return (*i & 0xFBF0) == 0xF2C0 && (*(i + 1) & 0x8000) == 0;
 }
 
-static int insn_movt_rd(uint16_t * i)
-{
+static int insn_movt_rd(uint16_t * i) {
     return (*(i + 1) >> 8) & 0xF;
 }
 
-static int insn_movt_imm(uint16_t * i)
-{
+static int insn_movt_imm(uint16_t * i) {
     return ((*i & 0xF) << 12) | ((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF);
 }
 
-static int insn_is_mov_imm(uint16_t * i)
-{
+static int insn_is_mov_imm(uint16_t * i) {
     if ((*i & 0xF800) == 0x2000)
         return 1;
     else if ((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
@@ -400,8 +283,7 @@ static int insn_is_mov_imm(uint16_t * i)
         return 0;
 }
 
-static int insn_mov_imm_rd(uint16_t * i)
-{
+static int insn_mov_imm_rd(uint16_t * i) {
     if ((*i & 0xF800) == 0x2000)
         return (*i >> 8) & 7;
     else if ((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
@@ -412,8 +294,7 @@ static int insn_mov_imm_rd(uint16_t * i)
         return 0;
 }
 
-static int insn_mov_imm_imm(uint16_t * i)
-{
+static int insn_mov_imm_imm(uint16_t * i) {
     if ((*i & 0xF800) == 0x2000)
         return *i & 0xF;
     else if ((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
@@ -424,190 +305,23 @@ static int insn_mov_imm_imm(uint16_t * i)
         return 0;
 }
 
-static int insn_is_cmp_imm(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x2800)
-        return 1;
-    else if ((*i & 0xFBF0) == 0xF1B0 && (*(i + 1) & 0x8F00) == 0x0F00)
-        return 1;
-    else
-        return 0;
-}
-
-static int insn_cmp_imm_rn(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x2800)
-        return (*i >> 8) & 7;
-    else if ((*i & 0xFBF0) == 0xF1B0 && (*(i + 1) & 0x8F00) == 0x0F00)
-        return *i & 0xF;
-    else
-        return 0;
-}
-
-static int insn_cmp_imm_imm(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x2800)
-        return *i & 0xFF;
-    else if ((*i & 0xFBF0) == 0xF1B0 && (*(i + 1) & 0x8F00) == 0x0F00)
-        return thumb_expand_imm_c(((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF));
-    else
-        return 0;
-}
-
-static int insn_is_and_imm(uint16_t * i)
-{
-    return (*i & 0xFBE0) == 0xF000 && (*(i + 1) & 0x8000) == 0;
-}
-
-static int insn_and_imm_rn(uint16_t * i)
-{
-    return *i & 0xF;
-}
-
-static int insn_and_imm_rd(uint16_t * i)
-{
-    return (*(i + 1) >> 8) & 0xF;
-}
-
-static int insn_and_imm_imm(uint16_t * i)
-{
-    return thumb_expand_imm_c(((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF));
-}
-
-static int insn_is_push(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0xB400)
-        return 1;
-    else if (*i == 0xE92D)
-        return 1;
-    else if (*i == 0xF84D && (*(i + 1) & 0x0FFF) == 0x0D04)
-        return 1;
-    else
-        return 0;
-}
-
-static int insn_push_registers(uint16_t * i)
-{
-    if ((*i & 0xFE00) == 0xB400)
-        return (*i & 0x00FF) | ((*i & 0x0100) << 6);
-    else if (*i == 0xE92D)
-        return *(i + 1);
-    else if (*i == 0xF84D && (*(i + 1) & 0x0FFF) == 0x0D04)
-        return 1 << ((*(i + 1) >> 12) & 0xF);
-    else
-        return 0;
-}
-
-static int insn_is_preamble_push(uint16_t * i)
-{
-    return insn_is_push(i) && (insn_push_registers(i) & (1 << 14)) != 0;
-}
-
-static int insn_is_str_imm(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x6000)
-        return 1;
-    else if ((*i & 0xF800) == 0x9000)
-        return 1;
-    else if ((*i & 0xFFF0) == 0xF8C0)
-        return 1;
-    else if ((*i & 0xFFF0) == 0xF840 && (*(i + 1) & 0x0800) == 0x0800)
-        return 1;
-    else
-        return 0;
-}
-
-static int insn_str_imm_postindexed(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x6000)
-        return 1;
-    else if ((*i & 0xF800) == 0x9000)
-        return 1;
-    else if ((*i & 0xFFF0) == 0xF8C0)
-        return 1;
-    else if ((*i & 0xFFF0) == 0xF840 && (*(i + 1) & 0x0800) == 0x0800)
-        return (*(i + 1) >> 10) & 1;
-    else
-        return 0;
-}
-
-static int insn_str_imm_wback(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x6000)
-        return 0;
-    else if ((*i & 0xF800) == 0x9000)
-        return 0;
-    else if ((*i & 0xFFF0) == 0xF8C0)
-        return 0;
-    else if ((*i & 0xFFF0) == 0xF840 && (*(i + 1) & 0x0800) == 0x0800)
-        return (*(i + 1) >> 8) & 1;
-    else
-        return 0;
-}
-
-static int insn_str_imm_imm(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x6000)
-        return (*i & 0x07C0) >> 4;
-    else if ((*i & 0xF800) == 0x9000)
-        return (*i & 0xFF) << 2;
-    else if ((*i & 0xFFF0) == 0xF8C0)
-        return (*(i + 1) & 0xFFF);
-    else if ((*i & 0xFFF0) == 0xF840 && (*(i + 1) & 0x0800) == 0x0800)
-        return (*(i + 1) & 0xFF);
-    else
-        return 0;
-}
-
-static int insn_str_imm_rt(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x6000)
-        return (*i & 7);
-    else if ((*i & 0xF800) == 0x9000)
-        return (*i >> 8) & 7;
-    else if ((*i & 0xFFF0) == 0xF8C0)
-        return (*(i + 1) >> 12) & 0xF;
-    else if ((*i & 0xFFF0) == 0xF840 && (*(i + 1) & 0x0800) == 0x0800)
-        return (*(i + 1) >> 12) & 0xF;
-    else
-        return 0;
-}
-
-static int insn_str_imm_rn(uint16_t * i)
-{
-    if ((*i & 0xF800) == 0x6000)
-        return (*i >> 3) & 7;
-    else if ((*i & 0xF800) == 0x9000)
-        return 13;
-    else if ((*i & 0xFFF0) == 0xF8C0)
-        return (*i & 0xF);
-    else if ((*i & 0xFFF0) == 0xF840 && (*(i + 1) & 0x0800) == 0x0800)
-        return (*i & 0xF);
-    else
-        return 0;
-}
-
 // Given an instruction, search backwards until an instruction is found matching the specified criterion.
-static uint16_t *find_last_insn_matching(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * current_instruction, int (*match_func) (uint16_t *))
-{
+static uint16_t *find_last_insn_matching(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * current_instruction, int (*match_func) (uint16_t *)) {
     while ((uintptr_t) current_instruction > (uintptr_t) kdata) {
         if (insn_is_32bit(current_instruction - 2) && !insn_is_32bit(current_instruction - 3)) {
             current_instruction -= 2;
         } else {
             --current_instruction;
         }
-
         if (match_func(current_instruction)) {
             return current_instruction;
         }
     }
-
     return NULL;
 }
 
 // Given an instruction and a register, find the PC-relative address that was stored inside the register by the time the instruction was reached.
-static uint32_t find_pc_rel_value(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * insn, int reg)
-{
+static uint32_t find_pc_rel_value(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * insn, int reg) {
     // Find the last instruction that completely wiped out this register
     int found = 0;
     uint16_t *current_instruction = insn;
@@ -646,19 +360,15 @@ static uint32_t find_pc_rel_value(uint32_t region, uint8_t * kdata, size_t ksize
                 // Can't handle this kind of operation!
                 return 0;
             }
-
             value += ((uintptr_t) current_instruction - (uintptr_t) kdata) + 4;
         }
-
         current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
     }
-
     return value;
 }
 
 // Find PC-relative references to a certain address (relative to kdata). This is basically a virtual machine that only cares about instructions used in PC-relative addressing, so no branches, etc.
-static uint16_t *find_literal_ref(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * insn, uint32_t address)
-{
+static uint16_t *find_literal_ref(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * insn, uint32_t address) {
     uint16_t *current_instruction = insn;
     uint32_t value[16];
     memset(value, 0, sizeof(value));
@@ -682,16 +392,13 @@ static uint16_t *find_literal_ref(uint32_t region, uint8_t * kdata, size_t ksize
                 }
             }
         }
-
         current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
     }
-
     return NULL;
 }
 
 // This points to kernel_pmap. Use that to change the page tables if necessary.
-uint32_t find_pmap_location(uint32_t region, uint8_t * kdata, size_t ksize)
-{
+static uint32_t find_pmap_location(uint32_t region, uint8_t * kdata, size_t ksize) {
     // Find location of the pmap_map_bd string.
     uint8_t *pmap_map_bd = memmem(kdata, ksize, "\"pmap_map_bd\"", sizeof("\"pmap_map_bd\""));
     if (!pmap_map_bd)
@@ -770,62 +477,35 @@ uint32_t find_pmap_location(uint32_t region, uint8_t * kdata, size_t ksize)
     return find_pc_rel_value(region, kdata, ksize, current_instruction, rd);
 }
 
-// Function to find the syscall 0 function pointer. Used to modify the syscall table to call our own code.
-uint32_t find_syscall0(uint32_t region, uint8_t * kdata, size_t ksize)
-{
-    // Search for the preamble to syscall 1
-    const uint8_t syscall1_search[] = { 0x90, 0xB5, 0x01, 0xAF, 0x82, 0xB0, 0x09, 0x68, 0x01, 0x24, 0x00, 0x23 };
-    void *ptr = memmem(kdata, ksize, syscall1_search, sizeof(syscall1_search));
-    if (!ptr)
-        return 0;
-
-    // Search for a pointer to syscall 1
-    uint32_t ptr_address = (uintptr_t) ptr - (uintptr_t) kdata + region;
-    uint32_t function = ptr_address | 1;
-    void *syscall1_entry = memmem(kdata, ksize, &function, sizeof(function));
-    if (!syscall1_entry)
-        return 0;
-
-    // Calculate the address of syscall 0 from the address of the syscall 1 entry
-    return (uintptr_t) syscall1_entry - (uintptr_t) kdata - 0x18;
-}
-
-// 0E E0 9F E7 FF FF FF EA C0 00 0C F1
-// ldr lr, [pc, lr]
-// b +0x0
-// cpsid if
-
-uint32_t find_larm_init_tramp(uint32_t region, uint8_t * kdata, size_t ksize)
-{
+static uint32_t find_larm_init_tramp(uint32_t region, uint8_t * kdata, size_t ksize) {
+    // ldr lr, [pc, lr]; b +0x0; cpsid if
     const uint8_t search[] = { 0x0E, 0xE0, 0x9F, 0xE7, 0xFF, 0xFF, 0xFF, 0xEA, 0xC0, 0x00, 0x0C, 0xF1 };
     void *ptr = memmem(kdata, ksize, search, sizeof(search));
     if (!ptr)
         return 0;
-
     return ((uintptr_t) ptr) - ((uintptr_t) kdata);
+}
+
+static task_t get_kernel_task() {
+    task_t kernel_task;
+    if (KERN_SUCCESS != task_for_pid(mach_task_self(), 0, &kernel_task)) {
+        printf("task_for_pid 0 failed.\n");
+        exit(1);
+    }
+    return kernel_task;
 }
 
 /* --- planetbeing patchfinder --- */
 
-uint32_t phys_addr_remap = 0x5fe00000;
-
-vm_address_t get_kernel_base()
-{
-    kern_return_t ret;
-    task_t kernel_task;
+static vm_address_t get_kernel_base(task_t kernel_task) {
     vm_region_submap_info_data_64_t info;
     vm_size_t size;
     mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
     unsigned int depth = 0;
     vm_address_t addr = 0x81200000; /* arm64: addr = 0xffffff8000000000 */
 
-    ret = task_for_pid(mach_task_self(), 0, &kernel_task);
-    if (ret != KERN_SUCCESS)
-        return -1;
-
     while (1) {
-        ret = vm_region_recurse_64(kernel_task, &addr, &size, &depth, (vm_region_info_t) & info, &info_count);
-        if (ret != KERN_SUCCESS)
+        if (KERN_SUCCESS != vm_region_recurse_64(kernel_task, &addr, &size, &depth, (vm_region_info_t) & info, &info_count))
             break;
         if (size > 1024 * 1024 * 1024) {
             /*
@@ -843,386 +523,252 @@ vm_address_t get_kernel_base()
                     break;
                 }
             }
+            printf("Kernel base is 0x%08x.\n", addr);
             return addr;
         }
         addr += size;
     }
 
-    return -1;
+    printf("Failed to get kernel base.\n");
+    exit(1);
 }
 
-static void generate_ttb_entries(void)
-{
-    uint32_t vaddr, vaddr_end, paddr, i;
-
-    paddr = PHYS_OFF;
-    vaddr = SHADOWMAP_BEGIN;
-    vaddr_end = SHADOWMAP_END;
-
-    for (i = vaddr; i <= vaddr_end; i += SHADOWMAP_GRANULARITY, paddr += SHADOWMAP_GRANULARITY) {
-#if SPURIOUS_DEBUG_OUTPUT
-        printf("ProtoTTE: 0x%08x for VA 0x%08x -> PA 0x%08x\n", L1_PROTO_TTE(paddr), i, paddr);
-#endif
-        ttb_template[TTB_OFFSET(i) >> PFN_SHIFT] = L1_PROTO_TTE(paddr);
-    }
-
-    /*
-     * Remap TTE for iBoot load address. 
-     */
-    uint32_t ttb_remap_addr_base = 0x7fe00000;
-    ttb_template[TTB_OFFSET(ttb_remap_addr_base) >> PFN_SHIFT] = L1_PROTO_TTE(phys_addr_remap);
-#if SPURIOUS_DEBUG_OUTPUT
-    printf("remap -> 0x%08x => 0x%08x (TTE: 0x%08x)\n", ttb_remap_addr_base, phys_addr_remap, L1_PROTO_TTE(phys_addr_remap));
-
-    printf("TTE offset begin for shadowmap: 0x%08x\n" "TTE offset end for shadowmap:   0x%08x\n" "TTE size:                       0x%08x\n", SHADOWMAP_BEGIN_OFF, SHADOWMAP_END_OFF, SHADOWMAP_SIZE);
-#endif
-
-    printf("New TTEs generated, base address for remap: 0x%08x, physBase: 0x%08x\n", PHYS_OFF, phys_addr_remap);
-    return;
-}
-
-
-static void schedule_autowake_during_notification(CFTimeInterval autowake_delay)
-{
-    int out_token;
-    uint32_t status = notify_register_dispatch(kIOPMSystemPowerStateNotify, &out_token, dispatch_get_main_queue(), ^(int token) {
-      CFDateRef date = CFDateCreate(0, CFAbsoluteTimeGetCurrent() + autowake_delay);
-      kern_return_t kr = IOPMSchedulePowerEvent(date, NULL, CFSTR("WakeRelativeToSleep"));
-      if (kr)
-        printf("IOPMSchedulePowerEvent returned %x.\n", kr);
-      else
-        printf("Scheduled autowake.\n");
-
-      // Exit the program now or run loop will continue running forever.
-      exit(0);
-    });
-
-    if (status != NOTIFY_STATUS_OK) {
-        err(1, "Failed to register for kIOPMSystemPowerStateNotify: %x\n", status);
-    }
-}
-
-#define DMPSIZE     0xd00000
-#define USE_INLINED_SHELLCODE 0
-
-#if USE_INLINED_SHELLCODE
-
-extern char shellcode_begin[], shellcode_end[];
-extern uint32_t larm_init_tramp;
-extern uint32_t flush_dcache, invalidate_icache;
-extern uint32_t kern_base, kern_tramp_phys;
-
-#else
-
-uint32_t larm_init_tramp;
-
-#endif
-
-int main(int argc, char *argv[])
-{
-    uint32_t chunksize = 2048;
-    struct stat st;
-
-    if (argc != 2) {
-        printf("usage: %s [loadfile]\n" "This will destroy the current running OS instance and fire up the loaded image.\n" "You have been warned.\n", argv[0]);
-        return -1;
-    }
-
-    if (stat(argv[1], &st) == -1) {
-        printf("Failed to open %s.\n", argv[1]);
-        return -1;
-    }
-
-    /*
-     * Get physbase. 
-     */
+static int get_cpid() {
     size_t size;
     sysctlbyname("kern.version", NULL, &size, NULL, 0);
-    char *osversion = malloc(size);
-    if (sysctlbyname("kern.version", osversion, &size, NULL, 0) == -1) {
-        printf("fail to kern.version sysctl\n");
-        exit(-1);
+    char *kern_version = malloc(size);
+    if (sysctlbyname("kern.version", kern_version, &size, NULL, 0) == -1) {
+        printf("Failed to get kern.version sysctl.\n");
+        exit(1);
     }
-#if SPURIOUS_DEBUG_OUTPUT
-    printf("%s\n", osversion);
-#endif
+    printf("kern.version: %s\n", kern_version);
 
-    if (strcasestr(osversion, "s5l8930x")) {
-        PHYS_OFF = S5L8930_PHYS_OFF;
-        phys_addr_remap = 0x5fe00000;
-    } else if (strcasestr(osversion, "s5l8920x") || strcasestr(osversion, "s5l8922x")) {
-        PHYS_OFF = S5L8930_PHYS_OFF;
-        phys_addr_remap = 0x4fe00000;
-    } else if (strcasestr(osversion, "s5l8940x") || strcasestr(osversion, "s5l8942x") || strcasestr(osversion, "s5l8947x")) {
-        /*
-         * All others have the high ram base. 
-         */
-        PHYS_OFF = S5L8940_PHYS_OFF;
-        phys_addr_remap = 0x9fe00000;
-    } else if (strcasestr(osversion, "s5l8945x")) {
-        PHYS_OFF = S5L8940_PHYS_OFF;
-        phys_addr_remap = 0xbfe00000;
-    } else if (strcasestr(osversion, "s5l8950x") || strcasestr(osversion, "s5l8955x")) {
-        PHYS_OFF = S5L8940_PHYS_OFF;
-        phys_addr_remap = 0xbfe00000;
+    uint32_t cpid = -1;
+    if (strcasestr(kern_version, "s5l8920x")) {
+        cpid = 0x8920;
+    } else if (strcasestr(kern_version, "s5l8922x")) {
+        cpid = 0x8922;
+    } else if (strcasestr(kern_version, "s5l8930x")) {
+        cpid = 0x8930;
+    } else if (strcasestr(kern_version, "s5l8940x")) {
+        cpid = 0x8940;
+    } else if (strcasestr(kern_version, "s5l8942x")) {
+        cpid = 0x8942;
+    } else if (strcasestr(kern_version, "s5l8945x")) {
+        cpid = 0x8945;
+    } else if (strcasestr(kern_version, "s5l8947x")) {
+        cpid = 0x8947;
+    } else if (strcasestr(kern_version, "s5l8950x")) {
+        cpid = 0x8950;
+    } else if (strcasestr(kern_version, "s5l8955x")) {
+        cpid = 0x8955;
     } else {
-        printf("Bravely assuming you're on an 8940-class device (unrecognized). You are on your own.\n");
-        /*
-         * All others have the high ram base. 
-         */
-        PHYS_OFF = S5L8940_PHYS_OFF;
-        phys_addr_remap = 0x9fe00000;
+        printf("Failed to recognize cpid from kern.version.\n");
+        exit(1);
     }
 
-    /*
-     * Pedanticness, though doesn't matter, after we quit the entire OS is gone lol 
-     */
-    free(osversion);
+    free(kern_version);
+    return cpid;
+}
 
-#if SPURIOUS_DEBUG_OUTPUT
-    printf("physOff 0x%08x remap 0x%08x\n", PHYS_OFF, phys_addr_remap);
-#endif
-
-    /*
-     * get kernel base. 
-     */
-    kernel_base = get_kernel_base();
-    if (kernel_base == (vm_address_t)-1) {
-        printf("failed to get kernel_baseel base...\n");
-        return -1;
+static void generate_ttb_entries(uint32_t gPhysBase, uint32_t phys_addr_remap, uint32_t ttb_remap_addr_base) {
+    for (uint32_t i = SHADOWMAP_BEGIN, paddr = gPhysBase; i <= SHADOWMAP_END; i += SHADOWMAP_GRANULARITY, paddr += SHADOWMAP_GRANULARITY) {
+        //printf("ProtoTTE: 0x%08x for VA 0x%08x -> PA 0x%08x\n", L1_PROTO_TTE(paddr), i, paddr);
+        ttb_template[TTB_OFFSET(i) >> PFN_SHIFT] = L1_PROTO_TTE(paddr);
     }
+    ttb_template[TTB_OFFSET(ttb_remap_addr_base) >> PFN_SHIFT] = L1_PROTO_TTE(phys_addr_remap);
 
-    printf("Kernel base is 0x%08x.\n", kernel_base);
+    //printf("remap -> 0x%08x => 0x%08x (TTE: 0x%08x)\n", ttb_remap_addr_base, phys_addr_remap, L1_PROTO_TTE(phys_addr_remap));
+    //printf("TTE offset begin for shadowmap: 0x%08x\n", SHADOWMAP_BEGIN_OFF);
+    //printf("TTE offset end for shadowmap:   0x%08x\n", SHADOWMAP_END_OFF);
+    //printf("TTE size:                       0x%08x\n", SHADOWMAP_SIZE);
+    printf("New TTEs generated, gPhysBase: 0x%08x, base address for remap: 0x%08x\n", gPhysBase, phys_addr_remap);
+}
 
-    /*
-     * we can now find the kernel pmap. 
-     */
-    kern_return_t r = task_for_pid(mach_task_self(), 0, &kernel_task);
-    if (r != 0) {
-        printf("task_for_pid failed.\n");
-        return -1;
-    }
-
-    /*
-     * kill 
-     */
-    vm_address_t addr = kernel_base + 0x1000, e = 0, sz = 0;
-    uint8_t *p = malloc(DMPSIZE + 0x1000);
-    pointer_t buf;
-
-    if (!p) {
-        printf("failed to malloc memory for kernel dump...\n");
-        return -1;
-    }
-    while (addr < (kernel_base + DMPSIZE)) {
-        vm_read(kernel_task, addr, chunksize, &buf, &sz);
+static void dump_kernel(task_t kernel_task, vm_address_t kernel_base, uint8_t *dest) {
+    for (vm_address_t addr = kernel_base + 0x1000, e = 0; addr < kernel_base + DMPSIZE; addr += CHUNKSIZE, e += CHUNKSIZE) {
+        pointer_t buf;
+        vm_address_t sz = 0;
+        vm_read(kernel_task, addr, CHUNKSIZE, &buf, &sz);
         if (!buf || sz == 0)
             continue;
-        uint8_t *z = (uint8_t *) buf;
-        addr += chunksize;
-        bcopy(z, p + e, chunksize);
-        e += chunksize;
+        bcopy((uint8_t *)buf, dest + e, CHUNKSIZE);
     }
+}
 
-    /*
-     * kernel dumped, now find pmap. 
-     */
-    uint32_t kernel_pmap = kernel_base + 0x1000 + find_pmap_location(kernel_base, (uint8_t *) p, DMPSIZE);
+static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint32_t gPhysBase, uint8_t *kernel_dump) {
+    /* Find pmap and dereference it for pmap_store */
+    uint32_t kernel_pmap = kernel_base + 0x1000 + find_pmap_location(kernel_base, kernel_dump, DMPSIZE);
     printf("kernel pmap is at 0x%08x.\n", kernel_pmap);
-
-    /*
-     * Read for kernel_pmap, dereference it for pmap_store. 
-     */
+    pointer_t buf = 0;
+    vm_address_t sz = 0;
     vm_read(kernel_task, kernel_pmap, 2048, &buf, &sz);
-    vm_read(kernel_task, *(vm_address_t *) (buf), 2048, &buf, &sz);
+    vm_read(kernel_task, *(vm_address_t *)(buf), 2048, &buf, &sz);
 
-    /*
-     * We now have the struct. Let's copy it out to get the TTE base (we don't really need to do this
-     * as it should just remain constant. TTEs should be after ToKD.)
-     */
+    /* Copy it out to get the TTE base (we don't need to do this as TTEs should just remain constant after ToKD) */
     pmap_partial_t *part = (pmap_partial_t *) buf;
-    uint32_t tte_virt = part->tte_virt;
-    uint32_t tte_phys = part->tte_phys;
-
-    printf("kernel pmap details: tte_virt: 0x%08x tte_phys: 0x%08x\n", tte_virt, tte_phys);
-    if (PHYS_OFF != (tte_phys & ~0xFFFFFFF)) {
-        printf("physOff 0x%08x should be 0x%08x\n", PHYS_OFF, tte_phys & ~0xFFFFFFF);
-        return -1;
+    printf("kernel pmap details: tte_virt: 0x%08x tte_phys: 0x%08x\n", part->tte_virt, part->tte_phys);
+    if (gPhysBase != (part->tte_phys & ~0xFFFFFFF)) {
+        printf("gPhysBase 0x%08x should be 0x%08x\n", gPhysBase, part->tte_phys & ~0xFFFFFFF);
+        exit(1);
     }
 
-    /*
-     * generate TTEs. 
-     */
-    generate_ttb_entries();
-
-    /*
-     * Now, we can start reading at the TTE base and start writing in the descriptors. 
-     */
-    uint32_t tte_off = SHADOWMAP_BEGIN_OFF;
-    vm_read(kernel_task, tte_virt + tte_off, 2048, &buf, &sz);
-    bcopy((char *) ttb_template_ptr + tte_off, (void *) buf, SHADOWMAP_SIZE);
-    vm_write(kernel_task, tte_virt + tte_off, buf, sz);
+    /* Now, we can start reading at the TTE base and start writing in the descriptors */
+    vm_read(kernel_task, SHADOWMAP_BEGIN_OFF + part->tte_virt, 2048, &buf, &sz);
+    bcopy(SHADOWMAP_BEGIN_OFF + (uint8_t *)ttb_template, (void *)buf, SHADOWMAP_SIZE);
+    vm_write(kernel_task, SHADOWMAP_BEGIN_OFF + part->tte_virt, buf, sz);
 
     printf("======================================================================================\n");
-    printf("!!!! Kernel TTE entries written. System stability is no longer guaranteed.\n");
-    printf("!!!! Security has also been reduced by an exponential factor. You have been warned.\n");
+    printf("!!!! Kernel TTE entries written. System stability is no longer guaranteed.            \n");
+    printf("!!!! Security has also been reduced by an exponential factor. You have been warned.   \n");
     printf("======================================================================================\n");
+}
 
-    if (signal(SIGINT, SIG_IGN) != SIG_IGN)
-        signal(SIGINT, SIG_IGN);
-
-    /*
-     * remap_address = 0x7ff00000 
-     */
-    FILE *f = fopen(argv[1], "rb");
+static void load_image_to_memory(const char *filename, uint8_t *addr) {
+    FILE *f = fopen(filename, "rb");
     if (!f) {
-        printf("Failed to open iBEC. Rebooting momentarily...\n");
-        sleep(3);
-        reboot(0);
+        printf("Failed to open the image file.\n");
+        exit(1);
     }
 
     fseek(f, 0, SEEK_END);
     int length = ftell(f);
     fseek(f, 0, SEEK_SET);
-    void *vp = malloc(length);
-    fread(vp, length, 1, f);
+
+    uint8_t *image = malloc(length);
+    if (!image) {
+        printf("Failed to allocate memory for image.\n");
+        exit(1);
+    }
+
+    fread(image, length, 1, f);
     fclose(f);
-    printf("Read bootloader into buffer %p, length %d\n", vp, length);
+    printf("Read image into buffer %p, length %d\n", image, length);
+    bcopy(image, addr, length);
+    free(image);
 
-    bcopy((void *) vp, (void *) 0x7fe00000, length);
-
-    /*
-     * Verify ARM header. 
-     */
-    if (*(uint32_t *) 0x7fe00000 != 0xea00000e) {
+    /* Verify ARM header */
+    if (*(uint32_t *)addr != 0xea00000e) {
         printf("This doesn't seem like an ARM image, perhaps it failed to copy? Continuing though.\n");
     }
 
-    printf("Image information: %s\n", (char *) 0x7fe00000 + 0x200);
-    printf("Image information: %s\n", (char *) 0x7fe00000 + 0x240);
-    printf("Image information: %s\n", (char *) 0x7fe00000 + 0x280);
+    printf("Image information: %s\n", addr + 0x200);
+    printf("Image information: %s\n", addr + 0x240);
+    printf("Image information: %s\n", addr + 0x280);
+}
 
-    free(vp);
-
-    /*
-     * iBEC copied, we need to copy over the shellcode now. 
-     */
-    uint32_t sysent_common = 0x1000 + find_syscall0(kernel_base + 0x1000, (uint8_t *) p, DMPSIZE) + SHADOWMAP_BEGIN;
-    printf("sysent_common_base: 0x%08x\n", sysent_common);
-
-    /*
-     * fuck evasi0n7 
-     */
-    if (*(uint32_t *) (sysent_common) == 0) {
-        printf("iOS 7 detected, adjusting base to 0x%08x = 0x%08x\n", sysent_common, *(uint32_t *) (sysent_common));
-        sysent_common += 4;
-        if (*(uint32_t *) (sysent_common) == 0) {
-            printf("Something is severely wrong (blaming iOS 7 anyhow). Rebooting momentarily.\n");
-            sleep(3);
-            reboot(0);
+static void schedule_autowake_during_sleep_notification(CFTimeInterval autowake_delay) {
+    int out_token;
+    uint32_t status = notify_register_dispatch(kIOPMSystemPowerStateNotify, &out_token, dispatch_get_main_queue(), ^(int token) {
+        CFDateRef date = CFDateCreate(0, CFAbsoluteTimeGetCurrent() + autowake_delay);
+        kern_return_t kr = IOPMSchedulePowerEvent(date, NULL, CFSTR("WakeRelativeToSleep"));
+        if (kr) {
+            printf("IOPMSchedulePowerEvent returned %x.\n", kr);
+            exit(1);
         }
+        printf("Scheduled autowake.\n");
+        /* Exit now, otherwise runloop will continue running forever */
+        exit(0);
+    });
+
+    if (NOTIFY_STATUS_OK != status) {
+        printf("Failed to register for kIOPMSystemPowerStateNotify: %x\n", status);
+        exit(1);
     }
+}
 
-    /*
-     * Set offsets. 
-     */
-    larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_base + 0x1000, (uint8_t *) p, DMPSIZE) + SHADOWMAP_BEGIN;
-
-#if USE_INLINED_SHELLCODE
-    kern_base = kernel_base;
-    kern_tramp_phys = phys_addr_remap;
-
-    printf("larm_init_tramp is at 0x%08x\n", larm_init_tramp);
-    bcopy(shellcode_begin, (void *) 0x7f000c00, shellcode_end - shellcode_begin);
-    *(uint32_t *) sysent_common = 0x7f000c01;
-
-    printf("Running shellcode now.\n");
-    syscall(0);
-#else
-    static uint32_t arm[2] = { 0xe51ff004, 0 };
-    arm[1] = phys_addr_remap;
-    // Requires D-cache writeback.
+static void hook_kernel_wakeup(vm_address_t kernel_base, uint8_t *kernel_dump, uint32_t phys_addr_remap) {
+    uint32_t arm[2] = { 0xe51ff004, phys_addr_remap };
+    /* Requires D-cache writeback */
+    uint32_t larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_base + 0x1000, kernel_dump, DMPSIZE) + SHADOWMAP_BEGIN;
     printf("Tramp %x COMMMAP\n", larm_init_tramp);
     printf("%lx, %lx\n", *(uintptr_t *) (larm_init_tramp), *(uintptr_t *) (larm_init_tramp + 4));
     printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
     bcopy((void *) arm, (void *) larm_init_tramp, sizeof(arm));
     printf("%lx, %lx\n", *(uintptr_t *) (larm_init_tramp), *(uintptr_t *) (larm_init_tramp + 4));
     printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
-#endif
+}
 
+static void request_sleep() {
     printf("Syncing disks.\n");
-    int diskSync;
-    for (diskSync = 0; diskSync < 10; diskSync++)
+    for (int disk_sync = 0; disk_sync < 10; disk_sync++) {
         sync();
+    }
 
     mach_port_t fb = IOPMFindPowerManagement(MACH_PORT_NULL);
     if (fb == MACH_PORT_NULL) {
-        err(1, "failed to get PM root port\n");
+        printf("Failed to get PowerManagement root port.\n");
+        exit(1);
     }
-
-    schedule_autowake_during_notification(2.0);
 
     printf("Magic happening now. (attempted!)\n");
     kern_return_t kr = IOPMSleepSystem(fb);
     if (kr) {
-        err(1, "IOPMSleepSystem returned %x\n", kr);
+        printf("IOPMSleepSystem returned %x\n", kr);
+        exit(1);
     }
-
-    // Never returns.
-    CFRunLoopRun();
-    return 0;
 }
 
-#if USE_INLINED_SHELLCODE
-/* how evil can you get???? */
-#if INLINE_IT_ALL
-/* hey, you gotta compile with -no-integrated-as */
-#ifdef __arm__
-__asm__("\n"
-        "    .code 16\n"
-        "    .thumb_func\n"
-        "    .align 2\n"
-        "    .data\n"
-        "    .globl _shellcode_begin\n"
-        "    .globl _shellcode_end\n"
-        "    .globl _larm_init_tramp\n"
-        "    .globl _flush_dcache\n"
-        "    .globl _invalidate_icache\n"
-        "    .globl _kern_tramp_phys\n"
-        "    .globl _kern_base\n"
-        "_shellcode_begin:\n"
-        "    mrs r12, cpsr\n"
-        "    cpsid   if\n"
-        "    ldr r0, 0f\n"
-        "    ldr r1, _kern_tramp_phys\n"
-        "    ldr r2, _larm_init_tramp\n"
-        "    str r0, [r2]\n"
-        "    str r1, [r2, #4]\n"
-        "    ldr r0, _kern_base\n"
-        "    @ Clear cache to PoC\n"
-        "    ldr r2, _larm_init_tramp\n"
-        "    bic r2, r2, #((1 << 6) - 1)\n"
-        "    mcr p15, 0, r2, c7, c14, 1\n"
-        "    mov r1, #256\n"
-        ".Lloop:\n"
-        "    add r2, r2, #(1 << 6)\n"
-        "    mcr p15, 0, r2, c7, c14, 1\n"
-        "    subs    r1, r1, #1\n"
-        "    bne .Lloop\n"
-        "    msr cpsr_c, r12\n"
-        "    movs    r0, #0\n"
-        "    bx  lr\n"
-        "    .align 2\n"
-        "0:  .long   0xe51ff004\n"
-        "_kern_tramp_phys:   .long   0x9bf00000\n"
-        "_kern_base:     .long   0xdeadbeef\n"
-        "_larm_init_tramp:   .long   0xdeadbeef\n"
-        "_flush_dcache:      .long   0xdeadbeef\n"
-        "_invalidate_icache: .long   0xdeadbeef\n"
-        "_shellcode_end:\n"
-        "    mov r8, r8\n");
-#else
-#error - this is only for ARM..
-#endif
-#endif
-#endif
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("usage: %s [loadfile]\n", argv[0]);
+        printf("This will destroy the current running OS instance and fire up the loaded image.\n");
+        printf("You have been warned.\n");
+        exit(1);
+    }
+
+    uint32_t gPhysBase = 0xdeadbeef;
+    uint32_t phys_addr_remap = 0xdeadbeef;
+    switch (get_cpid()) {
+        case 0x8920:
+        case 0x8922:
+            gPhysBase = 0x40000000;
+            phys_addr_remap = 0x4fe00000;
+            break;
+
+        case 0x8930:
+            gPhysBase = 0x40000000;
+            phys_addr_remap = 0x5fe00000;
+            break;
+
+        case 0x8940:
+        case 0x8942:
+        case 0x8947:
+            gPhysBase = 0x80000000;
+            phys_addr_remap = 0x9fe00000;
+            break;
+
+        case 0x8945:
+            gPhysBase = 0x80000000;
+            phys_addr_remap = 0xbfe00000;
+        break;
+
+        case 0x8950:
+        case 0x8955:
+            gPhysBase = 0x80000000;
+            phys_addr_remap = 0xbfe00000;
+            break;
+
+        default:
+            printf("Failed to recognize the chip.\n");
+            exit(1);
+    }
+
+    /* Remap TTE for iBoot load address */
+    uint32_t ttb_remap_addr_base = 0x7fe00000;
+    generate_ttb_entries(gPhysBase, phys_addr_remap, ttb_remap_addr_base);
+
+    task_t kernel_task = get_kernel_task();
+    vm_address_t kernel_base = get_kernel_base(kernel_task);
+    dump_kernel(kernel_task, kernel_base, kernel_dump);
+    signal(SIGINT, SIG_IGN);
+    write_tte_entries(kernel_task, kernel_base, gPhysBase, kernel_dump);
+    load_image_to_memory(argv[1], (uint8_t *)ttb_remap_addr_base);
+    hook_kernel_wakeup(kernel_base, kernel_dump, phys_addr_remap);
+    schedule_autowake_during_sleep_notification(2.0);
+    request_sleep();
+    CFRunLoopRun();
+
+    /* Never reached */
+    return 0;
+}
