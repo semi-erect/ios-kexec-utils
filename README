@@ -1,6 +1,22 @@
 ios-kexec-utils
 ===============
 
+NEW IMPROVED KLOADER
+
+* will automatically wake up device after 2 seconds (no button press required, should work 99.9% of the time)
+* supports iOS 4.0 and above (armv7 only, requires tfp0 kernel patch)
+* precompiled, just get the binary in bin directory
+
+Please report issues and I will do my best to fix them.
+
+Cheers,
+
+axi0mX
+
+
+
+LEGACY CODE
+
 A miscellany of utilities designed to help you bootstrap
 another operating system on an iOS device. They're probably crap.
 

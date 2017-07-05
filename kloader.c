@@ -19,13 +19,10 @@
  */
 /*
  * kloader
- * Requires iOS 6.x or 7.x. (This version only.)
+ * Requires: kernel patch for tfp0
+ * Supports: iOS 4.0 and above (ARMv7 only)
  *
- * Remap addresses:
- * 0x7fe00000 -> 0x9fe00000 (0x5fe00000) iBSS (jump-to only.)
- *
- * xcrun -sdk iphoneos clang kloader.c -arch armv7 -target arm-apple-darwin -framework IOKit -framework CoreFoundation -no-integrated-as \
- *     -DINLINE_IT_ALL=1 -Wall -o kloader -miphoneos-version-min=6.0 && ldid -Stfp0.plist kloader
+ * xcrun -sdk iphoneos clang kloader.c -arch armv7 -framework IOKit -framework CoreFoundation -Wall -miphoneos-version-min=4.0 -o kloader && ldid -Stfp0.plist kloader
  */
 
 #include <mach/mach.h>
@@ -36,6 +33,7 @@
 #include <sys/sysctl.h>
 #include <signal.h>
 #include <notify.h>
+#include <mach-o/loader.h>
 
 typedef mach_port_t io_service_t;
 extern mach_port_t kIOMasterPortDefault;
@@ -44,7 +42,7 @@ extern kern_return_t IOPMSchedulePowerEvent(CFDateRef time_to_wake, CFStringRef 
 extern kern_return_t IOPMSleepSystem(mach_port_t);
 
 /* ARM page bits for L1 sections */
-#define L1_SHIFT            20  /* log2(1MB) */
+#define L1_SHIFT             20  /* log2(1MB) */
 
 #define L1_SECT_PROTO        (1 << 1)   /* 0b10 */
 
@@ -95,14 +93,15 @@ extern kern_return_t IOPMSleepSystem(mach_port_t);
 
 #define TTB_SIZE                4096
 #define DEFAULT_KERNEL_SLIDE    0x80000000
+#define KERNEL_DUMP_SIZE        0xd00000
 #define CHUNKSIZE 2048
 
 #define NOTIFY_STATUS_OK 0
 #define kIOPMSystemPowerStateNotify "com.apple.powermanagement.systempowerstate"
+#define kIOPMSettingDebugWakeRelativeKey "WakeRelativeToSleep"
 
-#define DMPSIZE     0xd00000
-static uint8_t kernel_dump[DMPSIZE + 0x1000];
-static uint32_t ttb_template[TTB_SIZE] = { };
+static uint8_t kernel_dump[KERNEL_DUMP_SIZE + 0x1000] = {0};
+static uint32_t ttb_template[TTB_SIZE] = {0};
 
 typedef struct pmap_partial_t {
     uint32_t tte_virt;
@@ -142,11 +141,11 @@ static int thumb_expand_imm_c(uint16_t imm12) {
     }
 }
 
-static int insn_is_32bit(uint16_t * i) {
+static int insn_is_32bit(uint16_t *i) {
     return (*i & 0xe000) == 0xe000 && (*i & 0x1800) != 0x0;
 }
 
-static int insn_is_bl(uint16_t * i) {
+static int insn_is_bl(uint16_t *i) {
     if ((*i & 0xf800) == 0xf000 && (*(i + 1) & 0xd000) == 0xd000)
         return 1;
     else if ((*i & 0xf800) == 0xf000 && (*(i + 1) & 0xd001) == 0xc000)
@@ -155,7 +154,7 @@ static int insn_is_bl(uint16_t * i) {
         return 0;
 }
 
-static uint32_t insn_bl_imm32(uint16_t * i) {
+static uint32_t insn_bl_imm32(uint16_t *i) {
     uint16_t insn0 = *i;
     uint16_t insn1 = *(i + 1);
     uint32_t s = (insn0 >> 10) & 1;
@@ -169,11 +168,11 @@ static uint32_t insn_bl_imm32(uint16_t * i) {
     return imm32;
 }
 
-static int insn_is_b_conditional(uint16_t * i) {
+static int insn_is_b_conditional(uint16_t *i) {
     return (*i & 0xF000) == 0xD000 && (*i & 0x0F00) != 0x0F00 && (*i & 0x0F00) != 0xE;
 }
 
-static int insn_is_b_unconditional(uint16_t * i) {
+static int insn_is_b_unconditional(uint16_t *i) {
     if ((*i & 0xF800) == 0xE000)
         return 1;
     else if ((*i & 0xF800) == 0xF000 && (*(i + 1) & 0xD000) == 9)
@@ -182,11 +181,11 @@ static int insn_is_b_unconditional(uint16_t * i) {
         return 0;
 }
 
-static int insn_is_ldr_literal(uint16_t * i) {
+static int insn_is_ldr_literal(uint16_t *i) {
     return (*i & 0xF800) == 0x4800 || (*i & 0xFF7F) == 0xF85F;
 }
 
-static int insn_ldr_literal_rt(uint16_t * i) {
+static int insn_ldr_literal_rt(uint16_t *i) {
     if ((*i & 0xF800) == 0x4800)
         return (*i >> 8) & 7;
     else if ((*i & 0xFF7F) == 0xF85F)
@@ -195,7 +194,7 @@ static int insn_ldr_literal_rt(uint16_t * i) {
         return 0;
 }
 
-static int insn_ldr_literal_imm(uint16_t * i) {
+static int insn_ldr_literal_imm(uint16_t *i) {
     if ((*i & 0xF800) == 0x4800)
         return (*i & 0xF) << 2;
     else if ((*i & 0xFF7F) == 0xF85F)
@@ -204,19 +203,19 @@ static int insn_ldr_literal_imm(uint16_t * i) {
         return 0;
 }
 
-static int insn_ldr_imm_rt(uint16_t * i) {
+static int insn_ldr_imm_rt(uint16_t *i) {
     return (*i & 7);
 }
 
-static int insn_ldr_imm_rn(uint16_t * i) {
+static int insn_ldr_imm_rn(uint16_t *i) {
     return ((*i >> 3) & 7);
 }
 
-static int insn_ldr_imm_imm(uint16_t * i) {
+static int insn_ldr_imm_imm(uint16_t *i) {
     return ((*i >> 6) & 0x1F);
 }
 
-static int insn_is_add_reg(uint16_t * i) {
+static int insn_is_add_reg(uint16_t *i) {
     if ((*i & 0xFE00) == 0x1800)
         return 1;
     else if ((*i & 0xFF00) == 0x4400)
@@ -227,7 +226,7 @@ static int insn_is_add_reg(uint16_t * i) {
         return 0;
 }
 
-static int insn_add_reg_rd(uint16_t * i) {
+static int insn_add_reg_rd(uint16_t *i) {
     if ((*i & 0xFE00) == 0x1800)
         return (*i & 7);
     else if ((*i & 0xFF00) == 0x4400)
@@ -238,7 +237,7 @@ static int insn_add_reg_rd(uint16_t * i) {
         return 0;
 }
 
-static int insn_add_reg_rn(uint16_t * i) {
+static int insn_add_reg_rn(uint16_t *i) {
     if ((*i & 0xFE00) == 0x1800)
         return ((*i >> 3) & 7);
     else if ((*i & 0xFF00) == 0x4400)
@@ -249,7 +248,7 @@ static int insn_add_reg_rn(uint16_t * i) {
         return 0;
 }
 
-static int insn_add_reg_rm(uint16_t * i) {
+static int insn_add_reg_rm(uint16_t *i) {
     if ((*i & 0xFE00) == 0x1800)
         return (*i >> 6) & 7;
     else if ((*i & 0xFF00) == 0x4400)
@@ -260,19 +259,19 @@ static int insn_add_reg_rm(uint16_t * i) {
         return 0;
 }
 
-static int insn_is_movt(uint16_t * i) {
+static int insn_is_movt(uint16_t *i) {
     return (*i & 0xFBF0) == 0xF2C0 && (*(i + 1) & 0x8000) == 0;
 }
 
-static int insn_movt_rd(uint16_t * i) {
+static int insn_movt_rd(uint16_t *i) {
     return (*(i + 1) >> 8) & 0xF;
 }
 
-static int insn_movt_imm(uint16_t * i) {
+static int insn_movt_imm(uint16_t *i) {
     return ((*i & 0xF) << 12) | ((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF);
 }
 
-static int insn_is_mov_imm(uint16_t * i) {
+static int insn_is_mov_imm(uint16_t *i) {
     if ((*i & 0xF800) == 0x2000)
         return 1;
     else if ((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
@@ -283,7 +282,7 @@ static int insn_is_mov_imm(uint16_t * i) {
         return 0;
 }
 
-static int insn_mov_imm_rd(uint16_t * i) {
+static int insn_mov_imm_rd(uint16_t *i) {
     if ((*i & 0xF800) == 0x2000)
         return (*i >> 8) & 7;
     else if ((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
@@ -294,7 +293,7 @@ static int insn_mov_imm_rd(uint16_t * i) {
         return 0;
 }
 
-static int insn_mov_imm_imm(uint16_t * i) {
+static int insn_mov_imm_imm(uint16_t *i) {
     if ((*i & 0xF800) == 0x2000)
         return *i & 0xF;
     else if ((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
@@ -306,7 +305,7 @@ static int insn_mov_imm_imm(uint16_t * i) {
 }
 
 // Given an instruction, search backwards until an instruction is found matching the specified criterion.
-static uint16_t *find_last_insn_matching(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * current_instruction, int (*match_func) (uint16_t *)) {
+static uint16_t *find_last_insn_matching(uint8_t *kdata, size_t ksize, uint16_t *current_instruction, int (*match_func) (uint16_t *)) {
     while ((uintptr_t) current_instruction > (uintptr_t) kdata) {
         if (insn_is_32bit(current_instruction - 2) && !insn_is_32bit(current_instruction - 3)) {
             current_instruction -= 2;
@@ -321,7 +320,7 @@ static uint16_t *find_last_insn_matching(uint32_t region, uint8_t * kdata, size_
 }
 
 // Given an instruction and a register, find the PC-relative address that was stored inside the register by the time the instruction was reached.
-static uint32_t find_pc_rel_value(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * insn, int reg) {
+static uint32_t find_pc_rel_value(uint8_t *kdata, size_t ksize, uint16_t *insn, int reg) {
     // Find the last instruction that completely wiped out this register
     int found = 0;
     uint16_t *current_instruction = insn;
@@ -368,7 +367,7 @@ static uint32_t find_pc_rel_value(uint32_t region, uint8_t * kdata, size_t ksize
 }
 
 // Find PC-relative references to a certain address (relative to kdata). This is basically a virtual machine that only cares about instructions used in PC-relative addressing, so no branches, etc.
-static uint16_t *find_literal_ref(uint32_t region, uint8_t * kdata, size_t ksize, uint16_t * insn, uint32_t address) {
+static uint16_t *find_literal_ref(uint8_t *kdata, size_t ksize, uint16_t *insn, uint32_t address) {
     uint16_t *current_instruction = insn;
     uint32_t value[16];
     memset(value, 0, sizeof(value));
@@ -397,35 +396,145 @@ static uint16_t *find_literal_ref(uint32_t region, uint8_t * kdata, size_t ksize
     return NULL;
 }
 
+static int find_macho_section(struct mach_header *hdr, size_t size, const char *segname, const char *sectname, uint32_t *ret_addr, uint32_t *ret_size) {
+    /* Doesn't do bounds checking for size and other values */
+    if (hdr->magic == MH_MAGIC) {
+        struct load_command *cmd = (struct load_command *)(hdr + 1);
+        for (int i = 0; i < hdr->ncmds; i++) {
+            if (cmd->cmd == LC_SEGMENT) {
+                struct segment_command *seg = (struct segment_command *)cmd;
+                if (!strncmp(seg->segname, segname, 16)) {
+                    for (uint32_t j = 0; j < seg->nsects; j++) {
+                        struct section *sect = ((struct section *)(seg + 1)) + j;
+                        if (!strncmp(sect->sectname, sectname, 16)) {
+                            *ret_addr = sect->addr;
+                            *ret_size = sect->size;
+                            return 0;
+                        }
+                    }
+                }
+            }
+            cmd = (struct load_command *)(((uint8_t *)cmd) + cmd->cmdsize);
+        }
+    }
+    return 1;
+}
+
+/* Buggy, but re-implemented because some old versions of iOS don't have memmem */
+static void * buggy_memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
+    if (haystack == NULL || haystacklen == 0 || needle == NULL || needlelen == 0) {
+        printf("ERROR: Invalid arguments for buggy_memmem.\n");
+        exit(1);
+    }
+    for (size_t i = 0; i < haystacklen; i++) {
+        if (*(uint8_t *)(haystack + i) == *(uint8_t *)needle && i + needlelen <= haystacklen && 0 == memcmp(((uint8_t *)haystack) + i, needle, needlelen)) {
+            return (void *)(((uint8_t *)haystack) + i);
+        }
+    }
+    return NULL;
+}
+
+static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdata, size_t ksize) {
+    uint32_t vm_addr = 0, vm_size = 0;
+    /* Find location of __DATA __data section */
+    if (0 != find_macho_section((struct mach_header *)kdata, ksize, SEG_DATA, SECT_DATA, &vm_addr, &vm_size)) {
+        printf("ERROR: Failed to find __DATA __data in Mach-O header.\n");
+        exit(1);
+    }
+    /* Find location of the pmap_map_bd string */
+    uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
+    if (NULL == pmap_map_bd) {
+        printf("ERROR: Failed to find string \"pmap_map_bd\" in Mach-O.\n");
+        exit(1);
+    }
+    /* Find xref to string "pmap_map_bd" (that function also references kernel_pmap) */
+    uint32_t xref = 0;
+    for (size_t i = 0; i < ksize; i += 4)
+        if (*(uint32_t *)(kdata + i) == (uint32_t)(kernel_base + 0x1000 + pmap_map_bd - kdata)) {
+            xref = i;
+            break;
+        }
+    if (0 == xref) {
+        printf("ERROR: Failed to find xref to string \"pmap_map_bd\" in Mach-O.\n");
+        exit(1);
+    }
+    /* Find beginning of next function */
+    uint32_t next_func_start = 0;
+    for (int i = 0; i < 128; i += 2) {
+        if (*(uint16_t *)(kdata + xref + i) == 0xB5F0) {
+            /* Align to 4-byte boundary */
+            next_func_start = (xref + i) & ~3;
+            break;
+        }
+    }
+    if (0 == next_func_start) {
+        printf("ERROR: Failed to find next function within 128 bytes.\n");
+        exit(1);
+    }
+    /* Find end of this function */
+    uint32_t this_func_end = 0;
+    for (int i = 0; i < 64; i += 2) {
+        if (*(uint16_t *)(kdata + xref - i) == 0xBDF0) {
+            /* Align to 4-byte boundary */
+            this_func_end = (xref - i + 4) & ~3;
+            break;
+        }
+    }
+    if (0 == this_func_end) {
+        printf("ERROR: Failed to find end of this function within 64 bytes.\n");
+        exit(1);
+    }
+    uint32_t pmap = 0;
+    for (uint32_t *search = (uint32_t *)(kdata + this_func_end); search < (uint32_t *)(kdata + next_func_start); search += 1) {
+        if (vm_addr <= *search && *search < vm_addr + vm_size) {
+            if (pmap != 0 && pmap != *search) {
+                printf("ERROR: Multiple possible values within __DATA __data section were found.\n");
+                exit(1);
+            }
+            pmap = *search;
+        }
+    }
+    if (0 == pmap) {
+        printf("ERROR: No values within __DATA __data section were found.\n");
+        exit(1);
+    }
+    return pmap - (kernel_base + 0x1000);
+}
+
 // This points to kernel_pmap. Use that to change the page tables if necessary.
-static uint32_t find_pmap_location(uint32_t region, uint8_t * kdata, size_t ksize) {
+static uint32_t find_pmap_location(uint32_t kernel_base, uint8_t *kdata, size_t ksize) {
     // Find location of the pmap_map_bd string.
-    uint8_t *pmap_map_bd = memmem(kdata, ksize, "\"pmap_map_bd\"", sizeof("\"pmap_map_bd\""));
-    if (!pmap_map_bd)
+    uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
+    if (!pmap_map_bd) {
         return 0;
+    }
 
     // Find a reference to the pmap_map_bd string. That function also references kernel_pmap
-    uint16_t *ptr = find_literal_ref(region, kdata, ksize, (uint16_t *) kdata, (uintptr_t) pmap_map_bd - (uintptr_t) kdata);
-    if (!ptr)
+    uint16_t *ptr = find_literal_ref(kdata, ksize, (uint16_t *)kdata, (uintptr_t)pmap_map_bd - (uintptr_t)kdata);
+    if (!ptr) {
         return 0;
+    }
 
     // Find the beginning of it (we may have a version that throws panic after the function end).
     while (*ptr != 0xB5F0) {
-        if ((uint8_t *)ptr == kdata)
+        if ((uint8_t *)ptr == kdata) {
             return 0;
+        }
         ptr--;
     }
 
     // Find the end of it.
     const uint8_t search_function_end[] = { 0xF0, 0xBD };
-    ptr = memmem(ptr, ksize - ((uintptr_t) ptr - (uintptr_t) kdata), search_function_end, sizeof(search_function_end));
-    if (!ptr)
+    ptr = buggy_memmem(ptr, ksize - ((uintptr_t)ptr - (uintptr_t)kdata), search_function_end, sizeof(search_function_end));
+    if (!ptr) {
         return 0;
+    }
 
     // Find the last BL before the end of it. The third argument to it should be kernel_pmap
-    uint16_t *bl = find_last_insn_matching(region, kdata, ksize, ptr, insn_is_bl);
-    if (!bl)
+    uint16_t *bl = find_last_insn_matching(kdata, ksize, ptr, insn_is_bl);
+    if (!bl) {
         return 0;
+    }
 
     // Find the last LDR R2, [R*] before it that's before any branches. If there are branches, then we have a version of the function that assumes kernel_pmap instead of being passed it.
     uint16_t *ldr_r2 = NULL;
@@ -446,50 +555,51 @@ static uint32_t find_pmap_location(uint32_t region, uint8_t * kdata, size_t ksiz
     }
 
     // The function has a third argument, which must be kernel_pmap. Find out its address
-    if (ldr_r2)
-        return find_pc_rel_value(region, kdata, ksize, ldr_r2, insn_ldr_imm_rn(ldr_r2));
+    if (ldr_r2) {
+        return find_pc_rel_value(kdata, ksize, ldr_r2, insn_ldr_imm_rn(ldr_r2));
+    }
 
     // The function has no third argument, Follow the BL.
     uint32_t imm32 = insn_bl_imm32(bl);
     uint32_t target = ((uintptr_t) bl - (uintptr_t) kdata) + 4 + imm32;
-    if (target > ksize)
+    if (target > ksize) {
         return 0;
+    }
 
     // Find the first PC-relative reference in this function.
-    int found = 0;
-
-    int rd;
     current_instruction = (uint16_t *) (kdata + target);
     while ((uintptr_t) current_instruction < (uintptr_t) (kdata + ksize)) {
         if (insn_is_add_reg(current_instruction) && insn_add_reg_rm(current_instruction) == 15) {
-            found = 1;
-            rd = insn_add_reg_rd(current_instruction);
             current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
-            break;
+            return find_pc_rel_value(kdata, ksize, current_instruction, insn_add_reg_rd(current_instruction));
         }
-
         current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
     }
 
-    if (!found)
-        return 0;
-
-    return find_pc_rel_value(region, kdata, ksize, current_instruction, rd);
+    return 0;
 }
 
-static uint32_t find_larm_init_tramp(uint32_t region, uint8_t * kdata, size_t ksize) {
-    // ldr lr, [pc, lr]; b +0x0; cpsid if
-    const uint8_t search[] = { 0x0E, 0xE0, 0x9F, 0xE7, 0xFF, 0xFF, 0xFF, 0xEA, 0xC0, 0x00, 0x0C, 0xF1 };
-    void *ptr = memmem(kdata, ksize, search, sizeof(search));
-    if (!ptr)
-        return 0;
-    return ((uintptr_t) ptr) - ((uintptr_t) kdata);
+static uint32_t find_larm_init_tramp(uint8_t *kdata, size_t ksize) {
+    // ldr lr, [pc, lr];    b +0x0; cpsid if
+    const uint8_t search[]  = { 0x0E, 0xE0, 0x9F, 0xE7, 0xFF, 0xFF, 0xFF, 0xEA, 0xC0, 0x00, 0x0C, 0xF1 };
+    void *ptr = buggy_memmem(kdata, ksize, search, sizeof(search));
+    if (ptr) {
+      return ((uintptr_t)ptr) - ((uintptr_t)kdata);
+    }
+    // ldr lr, [pc #value]; b +0x0; cpsid if
+    const uint8_t search2[] = {/* ??, ?? */ 0x9F, 0xE5, 0xFF, 0xFF, 0xFF, 0xEA, 0xC0, 0x00, 0x0C, 0xF1 };
+    ptr = buggy_memmem(kdata, ksize, search2, sizeof(search2));
+    if (ptr) {
+      return ((uintptr_t)ptr) - 2 - ((uintptr_t)kdata);
+    }
+    printf("ERROR: Failed to locate larm_init_tramp.\n");
+    exit(1);
 }
 
 static task_t get_kernel_task() {
     task_t kernel_task;
     if (KERN_SUCCESS != task_for_pid(mach_task_self(), 0, &kernel_task)) {
-        printf("task_for_pid 0 failed.\n");
+        printf("ERROR: task_for_pid 0 failed.\n");
         exit(1);
     }
     return kernel_task;
@@ -516,20 +626,20 @@ static vm_address_t get_kernel_base(task_t kernel_task) {
             mach_msg_type_number_t sz = 0;
             addr += 0x200000;
             vm_read(kernel_task, addr + 0x1000, 512, &buf, &sz);
-            if (*((uint32_t *)buf) != 0xfeedface) {
+            if (*((uint32_t *)buf) != MH_MAGIC) {
                 addr -= 0x200000;
                 vm_read(kernel_task, addr + 0x1000, 512, &buf, &sz);
-                if (*((uint32_t*)buf) != 0xfeedface) {
+                if (*((uint32_t*)buf) != MH_MAGIC) {
                     break;
                 }
             }
-            printf("Kernel base is 0x%08x.\n", addr);
+            printf("kernel_base: 0x%08x\n", addr);
             return addr;
         }
         addr += size;
     }
 
-    printf("Failed to get kernel base.\n");
+    printf("ERROR: Failed to find kernel base.\n");
     exit(1);
 }
 
@@ -538,7 +648,7 @@ static int get_cpid() {
     sysctlbyname("kern.version", NULL, &size, NULL, 0);
     char *kern_version = malloc(size);
     if (sysctlbyname("kern.version", kern_version, &size, NULL, 0) == -1) {
-        printf("Failed to get kern.version sysctl.\n");
+        printf("ERROR: Failed to get kern.version sysctl.\n");
         exit(1);
     }
     printf("kern.version: %s\n", kern_version);
@@ -563,7 +673,7 @@ static int get_cpid() {
     } else if (strcasestr(kern_version, "s5l8955x")) {
         cpid = 0x8955;
     } else {
-        printf("Failed to recognize cpid from kern.version.\n");
+        printf("ERROR: Failed to recognize cpid from kern.version.\n");
         exit(1);
     }
 
@@ -582,11 +692,11 @@ static void generate_ttb_entries(uint32_t gPhysBase, uint32_t phys_addr_remap, u
     //printf("TTE offset begin for shadowmap: 0x%08x\n", SHADOWMAP_BEGIN_OFF);
     //printf("TTE offset end for shadowmap:   0x%08x\n", SHADOWMAP_END_OFF);
     //printf("TTE size:                       0x%08x\n", SHADOWMAP_SIZE);
-    printf("New TTEs generated, gPhysBase: 0x%08x, base address for remap: 0x%08x\n", gPhysBase, phys_addr_remap);
+    printf("New TTEs generated. Base address for remap: 0x%08x\n", phys_addr_remap);
 }
 
 static void dump_kernel(task_t kernel_task, vm_address_t kernel_base, uint8_t *dest) {
-    for (vm_address_t addr = kernel_base + 0x1000, e = 0; addr < kernel_base + DMPSIZE; addr += CHUNKSIZE, e += CHUNKSIZE) {
+    for (vm_address_t addr = kernel_base + 0x1000, e = 0; addr < kernel_base + KERNEL_DUMP_SIZE; addr += CHUNKSIZE, e += CHUNKSIZE) {
         pointer_t buf;
         vm_address_t sz = 0;
         vm_read(kernel_task, addr, CHUNKSIZE, &buf, &sz);
@@ -597,9 +707,17 @@ static void dump_kernel(task_t kernel_task, vm_address_t kernel_base, uint8_t *d
 }
 
 static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint32_t gPhysBase, uint8_t *kernel_dump) {
-    /* Find pmap and dereference it for pmap_store */
-    uint32_t kernel_pmap = kernel_base + 0x1000 + find_pmap_location(kernel_base, kernel_dump, DMPSIZE);
-    printf("kernel pmap is at 0x%08x.\n", kernel_pmap);
+    uint32_t kernel_pmap_offset = find_pmap_location(kernel_base, kernel_dump, KERNEL_DUMP_SIZE);
+    if (0 == kernel_pmap_offset && kernel_base == DEFAULT_KERNEL_SLIDE) {
+        /* find_pmap_location is only for iOS 6.0 and above, hopefully the second technique will work */
+        kernel_pmap_offset = find_pmap_location_pre_iOS_6(kernel_base, kernel_dump, KERNEL_DUMP_SIZE);
+    }
+    if (0 == kernel_pmap_offset) {
+        printf("ERROR: Failed to find kernel_pmap offset.");
+        exit(1);
+    }
+    uint32_t kernel_pmap = kernel_base + 0x1000 + kernel_pmap_offset;
+    printf("kernel_pmap: 0x%08x\n", kernel_pmap);
     pointer_t buf = 0;
     vm_address_t sz = 0;
     vm_read(kernel_task, kernel_pmap, 2048, &buf, &sz);
@@ -607,9 +725,11 @@ static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint
 
     /* Copy it out to get the TTE base (we don't need to do this as TTEs should just remain constant after ToKD) */
     pmap_partial_t *part = (pmap_partial_t *) buf;
-    printf("kernel pmap details: tte_virt: 0x%08x tte_phys: 0x%08x\n", part->tte_virt, part->tte_phys);
+    printf("kernel_pmap->tte_virt: 0x%08x\n", part->tte_virt);
+    printf("kernel_pmap->tte_phys: 0x%08x\n", part->tte_phys);
+    printf("gPhysBase: 0x%08x\n", gPhysBase);
     if (gPhysBase != (part->tte_phys & ~0xFFFFFFF)) {
-        printf("gPhysBase 0x%08x should be 0x%08x\n", gPhysBase, part->tte_phys & ~0xFFFFFFF);
+        printf("ERROR: Unexpected value for gPhysBase, should be: 0x%08x\n", part->tte_phys & ~0xFFFFFFF);
         exit(1);
     }
 
@@ -627,7 +747,7 @@ static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint
 static void load_image_to_memory(const char *filename, uint8_t *addr) {
     FILE *f = fopen(filename, "rb");
     if (!f) {
-        printf("Failed to open the image file.\n");
+        printf("ERROR: Failed to open the image file.\n");
         exit(1);
     }
 
@@ -637,13 +757,13 @@ static void load_image_to_memory(const char *filename, uint8_t *addr) {
 
     uint8_t *image = malloc(length);
     if (!image) {
-        printf("Failed to allocate memory for image.\n");
+        printf("ERROR: Failed to allocate memory for image.\n");
         exit(1);
     }
 
     fread(image, length, 1, f);
     fclose(f);
-    printf("Read image into buffer %p, length %d\n", image, length);
+    printf("Read image into buffer: %p length: %d\n", image, length);
     bcopy(image, addr, length);
     free(image);
 
@@ -661,18 +781,18 @@ static void schedule_autowake_during_sleep_notification(CFTimeInterval autowake_
     int out_token;
     uint32_t status = notify_register_dispatch(kIOPMSystemPowerStateNotify, &out_token, dispatch_get_main_queue(), ^(int token) {
         CFDateRef date = CFDateCreate(0, CFAbsoluteTimeGetCurrent() + autowake_delay);
-        kern_return_t kr = IOPMSchedulePowerEvent(date, NULL, CFSTR("WakeRelativeToSleep"));
+        kern_return_t kr = IOPMSchedulePowerEvent(date, NULL, CFSTR(kIOPMSettingDebugWakeRelativeKey));
         if (kr) {
-            printf("IOPMSchedulePowerEvent returned %x.\n", kr);
+            printf("ERROR: IOPMSchedulePowerEvent returned %x.\n", kr);
             exit(1);
         }
-        printf("Scheduled autowake.\n");
+        printf("Device should wake up in %.2f seconds.\n", autowake_delay);
         /* Exit now, otherwise runloop will continue running forever */
         exit(0);
     });
 
     if (NOTIFY_STATUS_OK != status) {
-        printf("Failed to register for kIOPMSystemPowerStateNotify: %x\n", status);
+        printf("ERROR: Failed to register for kIOPMSystemPowerStateNotify: %x\n", status);
         exit(1);
     }
 }
@@ -680,7 +800,7 @@ static void schedule_autowake_during_sleep_notification(CFTimeInterval autowake_
 static void hook_kernel_wakeup(vm_address_t kernel_base, uint8_t *kernel_dump, uint32_t phys_addr_remap) {
     uint32_t arm[2] = { 0xe51ff004, phys_addr_remap };
     /* Requires D-cache writeback */
-    uint32_t larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_base + 0x1000, kernel_dump, DMPSIZE) + SHADOWMAP_BEGIN;
+    uint32_t larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_dump, KERNEL_DUMP_SIZE) + SHADOWMAP_BEGIN;
     printf("Tramp %x COMMMAP\n", larm_init_tramp);
     printf("%lx, %lx\n", *(uintptr_t *) (larm_init_tramp), *(uintptr_t *) (larm_init_tramp + 4));
     printf("%x\n", *(uint32_t *) (0x7f000000 + 0x1000));
@@ -697,14 +817,23 @@ static void request_sleep() {
 
     mach_port_t fb = IOPMFindPowerManagement(MACH_PORT_NULL);
     if (fb == MACH_PORT_NULL) {
-        printf("Failed to get PowerManagement root port.\n");
+        printf("ERROR: Failed to get PowerManagement root port.\n");
         exit(1);
     }
 
     printf("Magic happening now. (attempted!)\n");
-    kern_return_t kr = IOPMSleepSystem(fb);
-    if (kr) {
-        printf("IOPMSleepSystem returned %x\n", kr);
+    bool success = false;
+    for (int i = 0; i < 10; i++) {
+        kern_return_t kr = IOPMSleepSystem(fb);
+        if (!kr) {
+            success = true;
+            break;
+        }
+        printf("WARNING: IOPMSleepSystem returned %x. Trying again.\n", kr);
+        sleep(1);
+    }
+    if (!success) {
+        printf("ERROR: IOPMSleepSystem failed.\n");
         exit(1);
     }
 }
@@ -739,10 +868,6 @@ int main(int argc, char *argv[]) {
             break;
 
         case 0x8945:
-            gPhysBase = 0x80000000;
-            phys_addr_remap = 0xbfe00000;
-        break;
-
         case 0x8950:
         case 0x8955:
             gPhysBase = 0x80000000;
@@ -750,18 +875,18 @@ int main(int argc, char *argv[]) {
             break;
 
         default:
-            printf("Failed to recognize the chip.\n");
+            printf("ERROR: Failed to recognize the chip.\n");
             exit(1);
     }
-
-    /* Remap TTE for iBoot load address */
-    uint32_t ttb_remap_addr_base = 0x7fe00000;
-    generate_ttb_entries(gPhysBase, phys_addr_remap, ttb_remap_addr_base);
 
     task_t kernel_task = get_kernel_task();
     vm_address_t kernel_base = get_kernel_base(kernel_task);
     dump_kernel(kernel_task, kernel_base, kernel_dump);
     signal(SIGINT, SIG_IGN);
+
+    /* Remap TTE for iBoot load address */
+    uint32_t ttb_remap_addr_base = 0x7fe00000;
+    generate_ttb_entries(gPhysBase, phys_addr_remap, ttb_remap_addr_base);
     write_tte_entries(kernel_task, kernel_base, gPhysBase, kernel_dump);
     load_image_to_memory(argv[1], (uint8_t *)ttb_remap_addr_base);
     hook_kernel_wakeup(kernel_base, kernel_dump, phys_addr_remap);
