@@ -20,7 +20,7 @@
 /*
  * kloader
  * Requires: kernel patch for tfp0
- * Supports: iOS 4.0 and above (ARMv7 only)
+ * Supports: iOS 4.0 and above (armv7 only)
  *
  * xcrun -sdk iphoneos clang kloader.c -arch armv7 -framework IOKit -framework CoreFoundation -Wall -miphoneos-version-min=4.0 -o kloader && ldid -Stfp0.plist kloader
  */
@@ -35,8 +35,6 @@
 #include <notify.h>
 #include <mach-o/loader.h>
 
-typedef mach_port_t io_service_t;
-extern mach_port_t kIOMasterPortDefault;
 extern mach_port_t IOPMFindPowerManagement(mach_port_t);
 extern kern_return_t IOPMSchedulePowerEvent(CFDateRef time_to_wake, CFStringRef my_id, CFStringRef type);
 extern kern_return_t IOPMSleepSystem(mach_port_t);
@@ -82,19 +80,14 @@ extern kern_return_t IOPMSleepSystem(mach_port_t);
 #define SHADOWMAP_END            0x7ff00000
 #define SHADOWMAP_GRANULARITY    0x00100000
 
-#define SHADOWMAP_SIZE_BYTES    (SHADOWMAP_END - SHADOWMAP_BEGIN)
-
 #define SHADOWMAP_BEGIN_OFF     TTB_OFFSET(SHADOWMAP_BEGIN)
 #define SHADOWMAP_END_OFF       TTB_OFFSET(SHADOWMAP_END)
 #define SHADOWMAP_SIZE          (SHADOWMAP_END_OFF - SHADOWMAP_BEGIN_OFF)
 
-#define SHADOWMAP_BEGIN_IDX     (SHADOWMAP_BEGIN_OFF >> PFN_SHIFT)
-#define SHADOWMAP_END_IDX       (SHADOWMAP_END_OFF >> PFN_SHIFT)
-
 #define TTB_SIZE                4096
 #define DEFAULT_KERNEL_SLIDE    0x80000000
 #define KERNEL_DUMP_SIZE        0xd00000
-#define CHUNKSIZE 2048
+#define CHUNK_SIZE 2048
 
 #define NOTIFY_STATUS_OK 0
 #define kIOPMSystemPowerStateNotify "com.apple.powermanagement.systempowerstate"
@@ -441,12 +434,14 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
         printf("ERROR: Failed to find __DATA __data in Mach-O header.\n");
         exit(1);
     }
+
     /* Find location of the pmap_map_bd string */
     uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
     if (NULL == pmap_map_bd) {
         printf("ERROR: Failed to find string \"pmap_map_bd\" in Mach-O.\n");
         exit(1);
     }
+
     /* Find xref to string "pmap_map_bd" (that function also references kernel_pmap) */
     uint32_t xref = 0;
     for (size_t i = 0; i < ksize; i += 4)
@@ -458,6 +453,7 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
         printf("ERROR: Failed to find xref to string \"pmap_map_bd\" in Mach-O.\n");
         exit(1);
     }
+
     /* Find beginning of next function */
     uint32_t next_func_start = 0;
     for (int i = 0; i < 128; i += 2) {
@@ -471,6 +467,7 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
         printf("ERROR: Failed to find next function within 128 bytes.\n");
         exit(1);
     }
+
     /* Find end of this function */
     uint32_t this_func_end = 0;
     for (int i = 0; i < 64; i += 2) {
@@ -484,6 +481,7 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
         printf("ERROR: Failed to find end of this function within 64 bytes.\n");
         exit(1);
     }
+
     uint32_t pmap = 0;
     for (uint32_t *search = (uint32_t *)(kdata + this_func_end); search < (uint32_t *)(kdata + next_func_start); search += 1) {
         if (vm_addr <= *search && *search < vm_addr + vm_size) {
@@ -498,11 +496,12 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
         printf("ERROR: No values within __DATA __data section were found.\n");
         exit(1);
     }
+
     return pmap - (kernel_base + 0x1000);
 }
 
 // This points to kernel_pmap. Use that to change the page tables if necessary.
-static uint32_t find_pmap_location(uint32_t kernel_base, uint8_t *kdata, size_t ksize) {
+static uint32_t find_pmap_location(uint8_t *kdata, size_t ksize) {
     // Find location of the pmap_map_bd string.
     uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
     if (!pmap_map_bd) {
@@ -586,12 +585,14 @@ static uint32_t find_larm_init_tramp(uint8_t *kdata, size_t ksize) {
     if (ptr) {
       return ((uintptr_t)ptr) - ((uintptr_t)kdata);
     }
+
     // ldr lr, [pc #value]; b +0x0; cpsid if
     const uint8_t search2[] = {/* ??, ?? */ 0x9F, 0xE5, 0xFF, 0xFF, 0xFF, 0xEA, 0xC0, 0x00, 0x0C, 0xF1 };
     ptr = buggy_memmem(kdata, ksize, search2, sizeof(search2));
     if (ptr) {
       return ((uintptr_t)ptr) - 2 - ((uintptr_t)kdata);
     }
+
     printf("ERROR: Failed to locate larm_init_tramp.\n");
     exit(1);
 }
@@ -604,8 +605,6 @@ static task_t get_kernel_task() {
     }
     return kernel_task;
 }
-
-/* --- planetbeing patchfinder --- */
 
 static vm_address_t get_kernel_base(task_t kernel_task) {
     vm_region_submap_info_data_64_t info;
@@ -696,18 +695,18 @@ static void generate_ttb_entries(uint32_t gPhysBase, uint32_t phys_addr_remap, u
 }
 
 static void dump_kernel(task_t kernel_task, vm_address_t kernel_base, uint8_t *dest) {
-    for (vm_address_t addr = kernel_base + 0x1000, e = 0; addr < kernel_base + KERNEL_DUMP_SIZE; addr += CHUNKSIZE, e += CHUNKSIZE) {
-        pointer_t buf;
+    for (vm_address_t addr = kernel_base + 0x1000, e = 0; addr < kernel_base + KERNEL_DUMP_SIZE; addr += CHUNK_SIZE, e += CHUNK_SIZE) {
+        pointer_t buf = 0;
         vm_address_t sz = 0;
-        vm_read(kernel_task, addr, CHUNKSIZE, &buf, &sz);
-        if (!buf || sz == 0)
+        vm_read(kernel_task, addr, CHUNK_SIZE, &buf, &sz);
+        if (buf == 0 || sz == 0)
             continue;
-        bcopy((uint8_t *)buf, dest + e, CHUNKSIZE);
+        bcopy((uint8_t *)buf, dest + e, CHUNK_SIZE);
     }
 }
 
 static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint32_t gPhysBase, uint8_t *kernel_dump) {
-    uint32_t kernel_pmap_offset = find_pmap_location(kernel_base, kernel_dump, KERNEL_DUMP_SIZE);
+    uint32_t kernel_pmap_offset = find_pmap_location(kernel_dump, KERNEL_DUMP_SIZE);
     if (0 == kernel_pmap_offset && kernel_base == DEFAULT_KERNEL_SLIDE) {
         /* find_pmap_location is only for iOS 6.0 and above, hopefully the second technique will work */
         kernel_pmap_offset = find_pmap_location_pre_iOS_6(kernel_base, kernel_dump, KERNEL_DUMP_SIZE);
@@ -716,6 +715,7 @@ static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint
         printf("ERROR: Failed to find kernel_pmap offset.");
         exit(1);
     }
+
     uint32_t kernel_pmap = kernel_base + 0x1000 + kernel_pmap_offset;
     printf("kernel_pmap: 0x%08x\n", kernel_pmap);
     pointer_t buf = 0;
@@ -797,7 +797,7 @@ static void schedule_autowake_during_sleep_notification(CFTimeInterval autowake_
     }
 }
 
-static void hook_kernel_wakeup(vm_address_t kernel_base, uint8_t *kernel_dump, uint32_t phys_addr_remap) {
+static void hook_kernel_wakeup(uint8_t *kernel_dump, uint32_t phys_addr_remap) {
     uint32_t arm[2] = { 0xe51ff004, phys_addr_remap };
     /* Requires D-cache writeback */
     uint32_t larm_init_tramp = 0x1000 + find_larm_init_tramp(kernel_dump, KERNEL_DUMP_SIZE) + SHADOWMAP_BEGIN;
@@ -822,20 +822,16 @@ static void request_sleep() {
     }
 
     printf("Magic happening now. (attempted!)\n");
-    bool success = false;
     for (int i = 0; i < 10; i++) {
         kern_return_t kr = IOPMSleepSystem(fb);
         if (!kr) {
-            success = true;
-            break;
+            return;
         }
         printf("WARNING: IOPMSleepSystem returned %x. Trying again.\n", kr);
         sleep(1);
     }
-    if (!success) {
-        printf("ERROR: IOPMSleepSystem failed.\n");
-        exit(1);
-    }
+    printf("ERROR: IOPMSleepSystem failed.\n");
+    exit(1);
 }
 
 int main(int argc, char *argv[]) {
@@ -889,7 +885,7 @@ int main(int argc, char *argv[]) {
     generate_ttb_entries(gPhysBase, phys_addr_remap, ttb_remap_addr_base);
     write_tte_entries(kernel_task, kernel_base, gPhysBase, kernel_dump);
     load_image_to_memory(argv[1], (uint8_t *)ttb_remap_addr_base);
-    hook_kernel_wakeup(kernel_base, kernel_dump, phys_addr_remap);
+    hook_kernel_wakeup(kernel_dump, phys_addr_remap);
     schedule_autowake_during_sleep_notification(2.0);
     request_sleep();
     CFRunLoopRun();
