@@ -764,6 +764,10 @@ static void load_image_to_memory(const char *filename, uint8_t *addr) {
     fread(image, length, 1, f);
     fclose(f);
     printf("Read image into buffer: %p length: %d\n", image, length);
+    if (*(uint32_t *)image == 'Img3') {
+        printf("ERROR: This is an IMG3 file. For now, only unpacked raw images are supported. IMG3 support is coming soon.\n");
+        exit(1);
+    }
     bcopy(image, addr, length);
     free(image);
 
