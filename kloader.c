@@ -428,13 +428,6 @@ static void * buggy_memmem(const void *haystack, size_t haystacklen, const void 
 }
 
 static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdata, size_t ksize) {
-    uint32_t vm_addr = 0, vm_size = 0;
-    /* Find location of __DATA __data section */
-    if (0 != find_macho_section((struct mach_header *)kdata, ksize, SEG_DATA, SECT_DATA, &vm_addr, &vm_size)) {
-        printf("ERROR: Failed to find __DATA __data in Mach-O header.\n");
-        exit(1);
-    }
-
     /* Find location of the pmap_map_bd string */
     uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
     if (NULL == pmap_map_bd) {
@@ -479,6 +472,13 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
     }
     if (0 == this_func_end) {
         printf("ERROR: Failed to find end of this function within 64 bytes.\n");
+        exit(1);
+    }
+
+    uint32_t vm_addr = 0, vm_size = 0;
+    /* Find location of __DATA __data section */
+    if (0 != find_macho_section((struct mach_header *)kdata, ksize, SEG_DATA, SECT_DATA, &vm_addr, &vm_size)) {
+        printf("ERROR: Failed to find __DATA __data in Mach-O header.\n");
         exit(1);
     }
 
@@ -672,7 +672,7 @@ static int get_cpid() {
     } else if (strcasestr(kern_version, "s5l8955x")) {
         cpid = 0x8955;
     } else {
-        printf("ERROR: Failed to recognize cpid from kern.version.\n");
+        printf("ERROR: Failed to recognize chip from kern.version.\n");
         exit(1);
     }
 
@@ -790,9 +790,10 @@ static void schedule_autowake_during_sleep_notification(CFTimeInterval autowake_
             printf("ERROR: IOPMSchedulePowerEvent returned %x.\n", kr);
             exit(1);
         }
-        printf("Device should wake up in %.2f seconds.\n", autowake_delay);
-        /* Exit now, otherwise runloop will continue running forever */
-        exit(0);
+        printf("Device should wake up in %.1f seconds.\n", autowake_delay);
+
+        /* Stop the runloop */
+        CFRunLoopStop(CFRunLoopGetCurrent());
     });
 
     if (NOTIFY_STATUS_OK != status) {
@@ -825,7 +826,7 @@ static void request_sleep() {
         exit(1);
     }
 
-    printf("Magic happening now. (attempted!)\n");
+    printf("Magic happening now. (Attempted!)\n");
     for (int i = 0; i < 10; i++) {
         kern_return_t kr = IOPMSleepSystem(fb);
         if (!kr) {
@@ -894,6 +895,5 @@ int main(int argc, char *argv[]) {
     request_sleep();
     CFRunLoopRun();
 
-    /* Never reached */
     return 0;
 }
