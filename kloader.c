@@ -427,14 +427,7 @@ static void * buggy_memmem(const void *haystack, size_t haystacklen, const void 
     return NULL;
 }
 
-static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdata, size_t ksize) {
-    /* Find location of the pmap_map_bd string */
-    uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
-    if (NULL == pmap_map_bd) {
-        printf("ERROR: Failed to find string \"pmap_map_bd\" in Mach-O.\n");
-        exit(1);
-    }
-
+static uint32_t find_kernel_pmap_pre_iOS_6(uint8_t *pmap_map_bd, uint32_t kernel_base, uint8_t *kdata, size_t ksize) {
     /* Find xref to string "pmap_map_bd" (that function also references kernel_pmap) */
     uint32_t xref = 0;
     for (size_t i = 0; i < ksize; i += 4)
@@ -443,7 +436,7 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
             break;
         }
     if (0 == xref) {
-        printf("ERROR: Failed to find xref to string \"pmap_map_bd\" in Mach-O.\n");
+        printf("ERROR: Failed to find xref to string \"pmap_map_bd\".\n");
         exit(1);
     }
 
@@ -501,13 +494,7 @@ static uint32_t find_pmap_location_pre_iOS_6(uint32_t kernel_base, uint8_t *kdat
 }
 
 // This points to kernel_pmap. Use that to change the page tables if necessary.
-static uint32_t find_pmap_location(uint8_t *kdata, size_t ksize) {
-    // Find location of the pmap_map_bd string.
-    uint8_t *pmap_map_bd = buggy_memmem(kdata, ksize, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
-    if (!pmap_map_bd) {
-        return 0;
-    }
-
+static uint32_t find_kernel_pmap_post_iOS_6(uint8_t *pmap_map_bd, uint8_t *kdata, size_t ksize) {
     // Find a reference to the pmap_map_bd string. That function also references kernel_pmap
     uint16_t *ptr = find_literal_ref(kdata, ksize, (uint16_t *)kdata, (uintptr_t)pmap_map_bd - (uintptr_t)kdata);
     if (!ptr) {
@@ -706,10 +693,19 @@ static void dump_kernel(task_t kernel_task, vm_address_t kernel_base, uint8_t *d
 }
 
 static void write_tte_entries(task_t kernel_task, vm_address_t kernel_base, uint32_t gPhysBase, uint8_t *kernel_dump) {
-    uint32_t kernel_pmap_offset = find_pmap_location(kernel_dump, KERNEL_DUMP_SIZE);
-    if (0 == kernel_pmap_offset && kernel_base == DEFAULT_KERNEL_SLIDE) {
-        /* find_pmap_location is only for iOS 6.0 and above, hopefully the second technique will work */
-        kernel_pmap_offset = find_pmap_location_pre_iOS_6(kernel_base, kernel_dump, KERNEL_DUMP_SIZE);
+    /* Find location of the pmap_map_bd string */
+    uint8_t *pmap_map_bd = buggy_memmem(kernel_dump, KERNEL_DUMP_SIZE, "\"pmap_map_bd\"", strlen("\"pmap_map_bd\""));
+    if (NULL == pmap_map_bd) {
+        printf("ERROR: Failed to find string \"pmap_map_bd\".\n");
+        exit(1);
+    }
+
+    uint32_t kernel_pmap_offset = 0;
+    if (kernel_base == DEFAULT_KERNEL_SLIDE) {
+        kernel_pmap_offset = find_kernel_pmap_pre_iOS_6(pmap_map_bd, kernel_base, kernel_dump, KERNEL_DUMP_SIZE);
+    }
+    else {
+        kernel_pmap_offset = find_kernel_pmap_post_iOS_6(pmap_map_bd, kernel_dump, KERNEL_DUMP_SIZE);
     }
     if (0 == kernel_pmap_offset) {
         printf("ERROR: Failed to find kernel_pmap offset.");
