@@ -155,6 +155,20 @@ static int get_cpid() {
     cpid = 0x7000;
   } else if (strcasestr(kern_version, "T7001")) {
     cpid = 0x7001;
+  } else if (strcasestr(kern_version, "S7002")) {
+    cpid = 0x7002;
+  } else if (strcasestr(kern_version, "S8000")) {
+    cpid = 0x8000;
+  } else if (strcasestr(kern_version, "S8001")) {
+    cpid = 0x8001;
+  } else if (strcasestr(kern_version, "T8002")) {
+    cpid = 0x8002;
+  } else if (strcasestr(kern_version, "S8003")) {
+    cpid = 0x8003;
+  } else if (strcasestr(kern_version, "T8010")) {
+    cpid = 0x8010;
+  } else if (strcasestr(kern_version, "T8011")) {
+    cpid = 0x8011;
   } else {
     printf("ERROR: Failed to recognize chip from kern.version.\n");
     exit(1);
@@ -351,15 +365,23 @@ int main(int argc, char *argv[]) {
       break;
 
     case 0x7000:
-    case 0x7001:
       gPhysBase = 0x800e00000;
       load_address = 0x83eb00000;
+      break;
+
+    case 0x7001:
+      gPhysBase = 0x800e00000;
+      load_address = 0x85eb00000;
       break;
 
     default:
       printf("ERROR: Failed to recognize the chip.\n");
       exit(1);
     }
+
+  /* Sync disks */
+  for (int i = 0; i < 10; i++)
+    sync();
 
   static uint8_t kernel_dump[KERNEL_DUMP_SIZE + IMAGE_OFFSET] = {0};
   task_t kernel_task = get_kernel_task();
@@ -376,7 +398,7 @@ int main(int argc, char *argv[]) {
   load_image_to_memory(kernel_task, kernel_base - gPhysBase + load_address, argv[1]);
   hook_kernel_wakeup(kernel_task, kernel_base, kernel_dump, gPhysBase, load_address);
 
-  printf("Syncing disks.\n");
+  /* Sync disks */
   for (int i = 0; i < 10; i++)
     sync();
 
